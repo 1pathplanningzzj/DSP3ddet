@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Environments
+.venv/
+venv/
+.env
+
+# Data, checkpoints, and generated outputs
+data/ScanNet-md40/mmdet_scannet
+data/ScanNet-md40/mmdet_scannet/
+data/ScanNet-md40/scans/
+data/TO-SCENE-down/TO-scannet/
+data/TO-SCENE-down/train/
+data/TO-SCENE-down/val/
+data/TO-SCENE-down/test/
+work_dirs/
+*.pth
+*.pt
+*.ckpt
+*.pkl
+*.bin
+*.tar
+*.tar.*
+*.zip
+*.ply
+
+# Demo/generated results
+demo/demo_data/
+demo/demo_results/
+
+# Logs
+*.log
+nohup.out
+
+# Editor/system
+.vscode/
+.idea/
+.DS_Store
