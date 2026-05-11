@@ -24,24 +24,20 @@ model = dict(
         prune_threshold=0.5,
         gaussian_pruning=dict(
             enabled=False,
-            mode='guide',
-            sigma_scale=0.5,
-            learnable_sigma=False,
-            sigma_min=0.1,
-            sigma_max=2.0,
-            guide_train_topk=False,
-            train_score_weight=0.0,
-            loss_weight=0.0,
-            num_primitives=2,
-            mean_offset_scale=1.5,
-            keep_threshold=0.5,
+            num_primitives=1,
             projection='nearest',
-            fusion='none',
-            prune=False,
+            keep_threshold=0.5,
             min_keep=1000,
             max_keep=100000,
-            primitive_loss_weight=0.01,
-            warmup_epochs=1),
+            warmup_epochs=1,
+            loss_weight=0.01,
+            primitive_loss_weight=0.0,
+            sigma_scale=0.5,
+            sigma_min=0.1,
+            sigma_max=2.0,
+            mean_offset_scale=1.5,
+            target_edge_prob=0.5,
+            chunk_size=65536),
         bbox_loss=dict(type='AxisAlignedIoULoss2', mode='diou', reduction='none')),
     train_cfg=dict(),
     test_cfg=dict(nms_pre=1000, iou_thr=.5, score_thr=.01))
@@ -51,7 +47,10 @@ optimizer = dict(type='AdamW', lr=.001, weight_decay=.0001)
 optimizer_config = dict(grad_clip=dict(max_norm=10, norm_type=2))
 lr_config = dict(policy='step', warmup=None, step=[8, 11])
 runner = dict(type='EpochBasedRunner', max_epochs=12)
-custom_hooks = [dict(type='EmptyCacheHook', after_iter=True)]
+custom_hooks = [
+    dict(type='EmptyCacheHook', after_iter=True),
+    dict(type='GaussianPruningEpochHook')
+]
 
 checkpoint_config = dict(interval=1, max_keep_ckpts=12)
 log_config = dict(

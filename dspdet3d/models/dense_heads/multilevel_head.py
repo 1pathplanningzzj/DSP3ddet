@@ -8,6 +8,7 @@ except ImportError:
         'Please follow `getting_started.md` to install MinkowskiEngine.`')
 
 import torch
+import torch.nn.functional as F
 from mmcv.cnn import bias_init_with_prob
 from mmcv.ops import nms3d, nms3d_normal
 from mmcv.runner import BaseModule
@@ -49,15 +50,24 @@ class DSPHead(BaseModule):
         self.prune_threshold = prune_threshold
         gaussian_pruning = gaussian_pruning or {}
         self.gaussian_pruning_enabled = gaussian_pruning.get('enabled', False)
+        self.gaussian_num_primitives = max(
+            1, int(gaussian_pruning.get('num_primitives', 1)))
+        self.gaussian_projection = gaussian_pruning.get('projection', 'nearest')
+        self.gaussian_keep_threshold = gaussian_pruning.get('keep_threshold', 0.5)
+        self.gaussian_min_keep = max(0, int(gaussian_pruning.get('min_keep', 1000)))
+        self.gaussian_max_keep = max(0, int(gaussian_pruning.get('max_keep', 100000)))
+        self.gaussian_warmup_epochs = max(
+            0, int(gaussian_pruning.get('warmup_epochs', 1)))
+        self.gaussian_loss_weight = gaussian_pruning.get('loss_weight', 0.01)
+        self.gaussian_primitive_loss_weight = gaussian_pruning.get(
+            'primitive_loss_weight', 0.0)
         self.gaussian_sigma_scale = gaussian_pruning.get('sigma_scale', 0.5)
-        self.gaussian_learnable_sigma = gaussian_pruning.get('learnable_sigma', False)
         self.gaussian_sigma_min = gaussian_pruning.get('sigma_min', 0.1)
         self.gaussian_sigma_max = gaussian_pruning.get('sigma_max', 2.0)
-        self.gaussian_guide_train_topk = gaussian_pruning.get('guide_train_topk', False)
-        self.gaussian_train_score_weight = gaussian_pruning.get('train_score_weight', 0.0)
-        self.gaussian_loss_weight = gaussian_pruning.get('loss_weight', 0.0)
-        if self.gaussian_learnable_sigma:
-            self.gaussian_sigma_logits = nn.Parameter(torch.zeros(3))
+        self.gaussian_mean_offset_scale = gaussian_pruning.get('mean_offset_scale', 1.5)
+        self.gaussian_target_edge_prob = gaussian_pruning.get('target_edge_prob', 0.5)
+        self.gaussian_chunk_size = max(1, int(gaussian_pruning.get('chunk_size', 65536)))
+        self.current_epoch = 0
         self.assigner = build_assigner(assigner)
         self.bbox_loss = build_loss(bbox_loss)
         self.cls_loss = build_loss(cls_loss)
@@ -110,6 +120,15 @@ class DSPHead(BaseModule):
             ME.MinkowskiConvolution(out_channels, 1, kernel_size=1, bias=True, dimension=3),
             ME.MinkowskiConvolution(out_channels, 1, kernel_size=1, bias=True, dimension=3)
         ])
+        if self.gaussian_pruning_enabled:
+            self.gaussian_param_conv = nn.ModuleList([
+                ME.MinkowskiConvolution(
+                    in_channels[i], self.gaussian_num_primitives * 5,
+                    kernel_size=1, bias=True, dimension=3)
+                for i in range(1, len(in_channels))
+            ])
+        else:
+            self.gaussian_param_conv = None
         self.pruning = ME.MinkowskiPruning()
 
         for i in range(len(in_channels)):
@@ -124,7 +143,7 @@ class DSPHead(BaseModule):
             self.__setattr__(
                         f'out_block_{i}',
                         self.make_block(in_channels[i], out_channels))
-        # ######only train keep_head  
+        # ######only train keep_head
         # for name, param in self.named_parameters():
         #     if "keep_conv" not in name:
         #         param.requires_grad=False
@@ -138,17 +157,27 @@ class DSPHead(BaseModule):
         for i in range(len(self.keep_conv)):
             nn.init.normal_(self.keep_conv[i].kernel, std=.01)
 
+        if self.gaussian_param_conv is not None:
+            for conv in self.gaussian_param_conv:
+                nn.init.normal_(conv.kernel, std=.01)
+                if conv.bias is not None:
+                    with torch.no_grad():
+                        conv.bias.zero_()
+                        bias = conv.bias.view(self.gaussian_num_primitives, 5)
+                        bias[:, 4] = bias_init_with_prob(.8)
+
         for n, m in self.named_modules():
             if ('bbox_conv' not in n) and ('cls_conv' not in n) \
-                and ('keep_conv' not in n) and ('loss' not in n):
+                and ('keep_conv' not in n) and ('gaussian_param_conv' not in n) \
+                and ('loss' not in n):
                 if isinstance(m, ME.MinkowskiConvolution):
                     ME.utils.kaiming_normal_(
                         m.kernel, mode='fan_out', nonlinearity='relu')
 
                 if isinstance(m, ME.MinkowskiBatchNorm):
                     nn.init.constant_(m.bn.weight, 1)
-                    nn.init.constant_(m.bn.bias, 0)       
-    
+                    nn.init.constant_(m.bn.bias, 0)
+
 
     def _forward_single(self, x):
         reg_final = self.bbox_conv(x).features
@@ -170,6 +199,114 @@ class DSPHead(BaseModule):
         return bbox_preds, cls_preds, points, prune_training
 
 
+    def _level_half_window(self, cur_level):
+        l0 = self.voxel_size * 2 ** 2
+        return (self.r * l0 * 2 ** (cur_level - 1)) / 2
+
+
+    def _gaussian_warmup_active(self):
+        return self.training and self.current_epoch < self.gaussian_warmup_epochs
+
+
+    def _predict_gaussian_primitives(self, x, transition_idx):
+        if self.gaussian_param_conv is None:
+            return None
+        return self.gaussian_param_conv[transition_idx](x)
+
+
+    def _evaluate_gaussian_field(self, target_x, source_params, cur_level):
+        if source_params is None:
+            return None, target_x.features.sum() * 0
+        if self.gaussian_projection != 'nearest':
+            raise NotImplementedError(
+                f'Unsupported gaussian projection: {self.gaussian_projection}')
+
+        keep_prob = target_x.features.new_zeros((len(target_x.features),))
+        regularizer = target_x.features.sum() * 0
+        if len(target_x.features) == 0:
+            return keep_prob, regularizer
+
+        source_valid = ME.SparseTensor(
+            source_params.features.new_ones((len(source_params.features), 1)),
+            coordinate_map_key=source_params.coordinate_map_key,
+            coordinate_manager=source_params.coordinate_manager)
+        source_centers = ME.SparseTensor(
+            source_params.coordinates[:, 1:].float() * self.voxel_size,
+            coordinate_map_key=source_params.coordinate_map_key,
+            coordinate_manager=source_params.coordinate_manager)
+
+        coords = target_x.coordinates.float()
+        target_points = target_x.coordinates[:, 1:].float() * self.voxel_size
+        half_window = target_x.features.new_tensor(self._level_half_window(cur_level))
+        sigma_base = torch.clamp(
+            target_x.features.new_tensor(self.gaussian_sigma_scale) * half_window,
+            min=1e-6)
+        sigma_range = self.gaussian_sigma_max - self.gaussian_sigma_min
+        n_chunks = 0
+
+        for start in range(0, len(target_x.features), self.gaussian_chunk_size):
+            end = min(start + self.gaussian_chunk_size, len(target_x.features))
+            query_coords = coords[start:end]
+            raw = source_params.features_at_coordinates(query_coords)
+            valid = source_valid.features_at_coordinates(query_coords).squeeze(1) > 0
+            centers = source_centers.features_at_coordinates(query_coords)
+            raw = raw.view(-1, self.gaussian_num_primitives, 5)
+
+            offset = torch.tanh(raw[..., :3]) * self.gaussian_mean_offset_scale * half_window
+            sigma_scale = self.gaussian_sigma_min + sigma_range * torch.sigmoid(raw[..., 3])
+            sigma = torch.clamp(sigma_base * sigma_scale, min=1e-6)
+            amplitude = torch.sigmoid(raw[..., 4])
+            mu = centers[:, None, :] + offset
+            distance = ((target_points[start:end, None, :] - mu) ** 2).sum(dim=-1)
+            primitive_scores = amplitude * torch.exp(-0.5 * distance / (sigma ** 2))
+            score = primitive_scores.max(dim=1).values.clamp(min=0, max=1)
+            score = torch.where(valid, score, score.new_zeros(score.shape))
+            keep_prob[start:end] = torch.nan_to_num(
+                score, nan=0.0, posinf=1.0, neginf=0.0)
+
+            if valid.any():
+                regularizer = regularizer + amplitude[valid].mean()
+            else:
+                regularizer = regularizer + amplitude.sum() * 0
+            n_chunks += 1
+
+        if n_chunks > 0:
+            regularizer = regularizer / n_chunks
+        return keep_prob, regularizer
+
+
+    def _make_gaussian_prune_mask(self, keep_prob, x):
+        with torch.no_grad():
+            prune_mask = keep_prob.new_zeros((len(keep_prob),), dtype=torch.bool)
+            for permutation in x.decomposition_permutations:
+                if len(permutation) == 0:
+                    continue
+                score = keep_prob[permutation]
+                keep = score >= self.gaussian_keep_threshold
+                if self.gaussian_max_keep > 0 and keep.sum() > self.gaussian_max_keep:
+                    topk = min(len(score), self.gaussian_max_keep)
+                    ids = torch.topk(score, topk, sorted=False).indices
+                    keep = torch.zeros_like(keep)
+                    keep[ids] = True
+                min_keep = min(len(score), self.gaussian_min_keep)
+                if min_keep > 0 and keep.sum() < min_keep:
+                    ids = torch.topk(score, min_keep, sorted=False).indices
+                    keep = torch.zeros_like(keep)
+                    keep[ids] = True
+                if keep.sum() == 0:
+                    ids = torch.topk(score, 1, sorted=False).indices
+                    keep[ids] = True
+                prune_mask[permutation[keep]] = True
+        return prune_mask
+
+
+    def _prune_by_gaussian(self, x, keep_prob):
+        prune_mask = self._make_gaussian_prune_mask(keep_prob, x)
+        if prune_mask.sum() == 0:
+            return x
+        return self.pruning(x, prune_mask)
+
+
     def forward(self, x, gt_bboxes, gt_labels, img_metas):
 
         bboxes_level = []
@@ -185,7 +322,7 @@ class DSPHead(BaseModule):
                     for i in range(len(downsample_times)):
                         if bbox_volume > self.volume_threshold * (self.voxel_size * 2 ** downsample_times[i]) ** 3:
                             bbox_level[n] = 3 - i
-                            break                  
+                            break
                 bboxes_level.append(bbox_level)
                 bbox_state = torch.cat((bbox_level, bbox_state), dim=1)
                 bboxes_state.append(bbox_state)
@@ -201,7 +338,7 @@ class DSPHead(BaseModule):
                 bboxes_state.append(bbox_state)
         bbox_preds, cls_preds, points = [], [], []
         keep_gts = []
-        gaussian_gts = []
+        gaussian_preds, gaussian_targets, gaussian_regularizers = [], [], []
         keep_preds, prune_masks = [], []
         prune_mask = None
         inputs = x
@@ -209,25 +346,15 @@ class DSPHead(BaseModule):
         for i in range(len(inputs) - 1, -1, -1):
             if i < len(inputs) - 1:
                 prune_mask = self._get_keep_voxel(x, i + 2, bboxes_state, img_metas)
-                if self.gaussian_pruning_enabled:
-                    gaussian_score = self._get_gaussian_score(
-                        x, i + 2, bboxes_state, img_metas, prune_mask)
-                    gaussian_sparse = ME.SparseTensor(
-                        gaussian_score.unsqueeze(1),
-                        coordinate_map_key=x.coordinate_map_key,
-                        coordinate_manager=x.coordinate_manager)
-                else:
-                    gaussian_score = None
-                    gaussian_sparse = None
                 keep_gt = []
-                gaussian_gt = []
-                for permutation in out.decomposition_permutations:
+                for permutation in x.decomposition_permutations:
                     keep_gt.append(prune_mask[permutation])
-                    if gaussian_score is not None:
-                        gaussian_gt.append(gaussian_score[permutation])
                 keep_gts.append(keep_gt)
-                if gaussian_score is not None:
-                    gaussian_gts.append(gaussian_gt)
+
+                gaussian_params = None
+                if self.gaussian_pruning_enabled:
+                    gaussian_params = self._predict_gaussian_primitives(x, i)
+
                 x = self.__getattr__(f'up_block_{i + 1}')(x)
                 coords = x.coordinates.float()
                 x_level_features = inputs[i].features_at_coordinates(coords)
@@ -235,7 +362,27 @@ class DSPHead(BaseModule):
                                           coordinate_map_key=x.coordinate_map_key,
                                         coordinate_manager=x.coordinate_manager)
                 x = x + x_level
-                x = self._prune_training(x, prune_training_keep, gaussian_sparse)
+
+                if self.gaussian_pruning_enabled:
+                    gaussian_keep_prob, gaussian_regularizer = self._evaluate_gaussian_field(
+                        x, gaussian_params, i + 2)
+                    gaussian_target, _ = self._get_gaussian_targets(
+                        x, i + 2, bboxes_state, img_metas)
+                    gaussian_pred_level = []
+                    gaussian_target_level = []
+                    for permutation in x.decomposition_permutations:
+                        gaussian_pred_level.append(gaussian_keep_prob[permutation])
+                        gaussian_target_level.append(gaussian_target[permutation])
+                    gaussian_preds.append(gaussian_pred_level)
+                    gaussian_targets.append(gaussian_target_level)
+                    gaussian_regularizers.append(gaussian_regularizer)
+
+                    if self._gaussian_warmup_active():
+                        x = self._prune_training(x, prune_training_keep)
+                    else:
+                        x = self._prune_by_gaussian(x, gaussian_keep_prob)
+                else:
+                    x = self._prune_training(x, prune_training_keep)
 
             if i > 0:
                 keep_scores = self.keep_conv[i-1](x)
@@ -256,12 +403,14 @@ class DSPHead(BaseModule):
             cls_preds.append(cls_pred)
             points.append(point)
 
-        if self.gaussian_pruning_enabled:
-            gaussian_gts = gaussian_gts[::-1]
-        else:
-            gaussian_gts = None
-        return bbox_preds[::-1], cls_preds[::-1], points[::-1], keep_preds[::-1], keep_gts[::-1], gaussian_gts, bboxes_level
-    
+        if not self.gaussian_pruning_enabled:
+            gaussian_preds = None
+            gaussian_targets = None
+            gaussian_regularizers = None
+        return (bbox_preds[::-1], cls_preds[::-1], points[::-1],
+                keep_preds[::-1], keep_gts[::-1], gaussian_preds, gaussian_targets,
+                gaussian_regularizers, bboxes_level)
+
 
     def _prune_inference(self, x, scores):
         """Prunes the tensor by score thresholding.
@@ -291,7 +440,7 @@ class DSPHead(BaseModule):
         return x
 
 
-    def _prune_training(self, x, scores, gaussian_scores=None):
+    def _prune_training(self, x, scores):
         """Prunes the tensor by score thresholding.
 
         Args:
@@ -305,11 +454,6 @@ class DSPHead(BaseModule):
         with torch.no_grad():
             coordinates = x.C.float()
             interpolated_scores = scores.features_at_coordinates(coordinates)
-            if (gaussian_scores is not None and self.gaussian_guide_train_topk
-                    and self.gaussian_train_score_weight > 0):
-                interpolated_gaussian = gaussian_scores.features_at_coordinates(coordinates)
-                interpolated_scores = interpolated_scores + \
-                    self.gaussian_train_score_weight * interpolated_gaussian
             prune_mask = interpolated_scores.new_zeros(
                 (len(interpolated_scores)), dtype=torch.bool)
             for permutation in x.decomposition_permutations:
@@ -330,7 +474,7 @@ class DSPHead(BaseModule):
             bboxes.append([])
         for idx in range(len(input_metas)):
             for n in range(len(bboxes_state[idx])):
-                if bboxes_state[idx][n][0] < (cur_level - 1):    
+                if bboxes_state[idx][n][0] < (cur_level - 1):
                     bboxes[idx].append(bboxes_state[idx][n])
         idx = 0
         mask = []
@@ -359,12 +503,12 @@ class DSPHead(BaseModule):
                         shift = rotation_3d_in_axis(
                             shift, -boxes_l[0, :, 7], axis=2).permute(1, 0, 2)
                         centers = boxes_l[..., 1:4] + shift
-                        up_level_l = self.r 
-                        dx_min = centers[..., 0] - boxes_l[..., 1] + (up_level_l * l0 * 2 ** (cur_level - 1)) / 2  
-                        dx_max = boxes_l[..., 1] - centers[..., 0] + (up_level_l * l0 * 2 ** (cur_level - 1)) / 2 
-                        dy_min = centers[..., 1] - boxes_l[..., 2] + (up_level_l * l0 * 2 ** (cur_level - 1)) / 2  
+                        up_level_l = self.r
+                        dx_min = centers[..., 0] - boxes_l[..., 1] + (up_level_l * l0 * 2 ** (cur_level - 1)) / 2
+                        dx_max = boxes_l[..., 1] - centers[..., 0] + (up_level_l * l0 * 2 ** (cur_level - 1)) / 2
+                        dy_min = centers[..., 1] - boxes_l[..., 2] + (up_level_l * l0 * 2 ** (cur_level - 1)) / 2
                         dy_max = boxes_l[..., 2] - centers[..., 1] + (up_level_l * l0 * 2 ** (cur_level - 1)) / 2
-                        dz_min = centers[..., 2] - boxes_l[..., 3] + (up_level_l * l0 * 2 ** (cur_level - 1)) / 2  
+                        dz_min = centers[..., 2] - boxes_l[..., 3] + (up_level_l * l0 * 2 ** (cur_level - 1)) / 2
                         dz_max = boxes_l[..., 3] - centers[..., 2] + (up_level_l * l0 * 2 ** (cur_level - 1)) / 2
 
 
@@ -372,7 +516,7 @@ class DSPHead(BaseModule):
                         inside_box_condition = distance.min(dim=-1).values > 0
                         inside_box_condition = inside_box_condition.sum(dim=1)
                         inside_box_condition = inside_box_condition >= 1
-                        inside_box_conditions += inside_box_condition
+                        inside_box_conditions = inside_box_conditions | inside_box_condition
                 mask.append(inside_box_conditions)
             else:
                 inside_box_conditions = torch.zeros((len(permutation)), dtype=torch.bool).to(point.device)
@@ -383,16 +527,10 @@ class DSPHead(BaseModule):
         return prune_mask
 
 
-    def _get_level_sigma_scale(self, cur_level):
-        if not self.gaussian_learnable_sigma:
-            return self.gaussian_sigma_scale
-        level_idx = max(0, min(cur_level - 2, len(self.gaussian_sigma_logits) - 1))
-        sigma_range = self.gaussian_sigma_max - self.gaussian_sigma_min
-        return self.gaussian_sigma_min + sigma_range * torch.sigmoid(
-            self.gaussian_sigma_logits[level_idx])
-
-
-    def _get_gaussian_score(self, input, cur_level, bboxes_state, input_metas, keep_mask):
+    @torch.no_grad()
+    def _get_gaussian_targets(self, input, cur_level, bboxes_state, input_metas):
+        hard_support = self._get_keep_voxel(input, cur_level, bboxes_state, input_metas)
+        targets = input.features.new_zeros((len(input.features),))
         bboxes = []
         for _ in range(len(input_metas)):
             bboxes.append([])
@@ -401,33 +539,37 @@ class DSPHead(BaseModule):
                 if bboxes_state[idx][n][0] < (cur_level - 1):
                     bboxes[idx].append(bboxes_state[idx][n])
 
-        gaussian_scores = input.features.new_zeros((len(input.features),))
-        l0 = self.voxel_size * 2 ** 2
-        half_window = (self.r * l0 * 2 ** (cur_level - 1)) / 2
-        sigma_scale = self._get_level_sigma_scale(cur_level)
-        sigma = torch.clamp(sigma_scale * half_window, min=1e-6)
-        for idx, permutation in enumerate(input.decomposition_permutations):
-            candidate_mask = keep_mask[permutation]
-            if candidate_mask.sum() == 0 or len(bboxes[idx]) == 0:
-                continue
-            candidate_ids = permutation[candidate_mask]
-            point = input.coordinates[candidate_ids][:, 1:] * self.voxel_size
-            boxes = torch.cat(bboxes[idx]).reshape([-1, 8]).to(point.device)
-            point_l = point.unsqueeze(1).expand(len(point), len(boxes), 3)
-            boxes_l = boxes.unsqueeze(0).expand(len(point), len(boxes), 8)
-            shift = torch.stack(
-                (point_l[..., 0] - boxes_l[..., 1],
-                 point_l[..., 1] - boxes_l[..., 2],
-                 point_l[..., 2] - boxes_l[..., 3]),
-                dim=-1).permute(1, 0, 2)
-            shift = rotation_3d_in_axis(
-                shift, -boxes[:, 7], axis=2).permute(1, 0, 2)
-            normalized_shift = shift / sigma
-            box_scores = torch.exp(
-                -0.5 * (normalized_shift ** 2).sum(dim=-1))
-            gaussian_scores[candidate_ids] = box_scores.max(dim=1).values
+        edge_prob = min(max(float(self.gaussian_target_edge_prob), 1e-4), 0.999)
+        edge_prob = input.features.new_tensor(edge_prob)
+        half_window = input.features.new_tensor(self._level_half_window(cur_level))
+        sigma = half_window / torch.sqrt(-2 * torch.log(edge_prob))
+        sigma = torch.clamp(sigma, min=1e-6)
 
-        return gaussian_scores
+        for idx, permutation in enumerate(input.decomposition_permutations):
+            support = hard_support[permutation]
+            if support.sum() == 0 or len(bboxes[idx]) == 0:
+                continue
+            local_ids = torch.nonzero(support, as_tuple=False).squeeze(1)
+            global_ids = permutation[local_ids]
+            boxes = torch.cat(bboxes[idx]).reshape([-1, 8]).to(input.device)
+            for start in range(0, len(global_ids), self.gaussian_chunk_size):
+                end = min(start + self.gaussian_chunk_size, len(global_ids))
+                ids = global_ids[start:end]
+                point = input.coordinates[ids][:, 1:] * self.voxel_size
+                point_l = point.unsqueeze(1).expand(len(point), len(boxes), 3)
+                boxes_l = boxes.unsqueeze(0).expand(len(point), len(boxes), 8)
+                shift = torch.stack(
+                    (point_l[..., 0] - boxes_l[..., 1],
+                     point_l[..., 1] - boxes_l[..., 2],
+                     point_l[..., 2] - boxes_l[..., 3]),
+                    dim=-1).permute(1, 0, 2)
+                shift = rotation_3d_in_axis(
+                    shift, -boxes[:, 7], axis=2).permute(1, 0, 2)
+                score = torch.exp(-0.5 * (shift ** 2).sum(dim=-1) / (sigma ** 2))
+                targets[ids] = score.max(dim=1).values.clamp(min=0, max=1)
+
+        targets = targets * hard_support.float()
+        return targets, hard_support
 
 
     @staticmethod
@@ -533,9 +675,44 @@ class DSPHead(BaseModule):
         return bbox_loss, cls_loss, pos_mask
 
 
+    def _gaussian_loss(self, gaussian_preds, gaussian_targets, gaussian_regularizers):
+        if gaussian_preds is None or gaussian_targets is None:
+            return None, None
+        prune_losses = []
+        for pred_level, target_level in zip(gaussian_preds, gaussian_targets):
+            for pred, target in zip(pred_level, target_level):
+                if len(pred) == 0:
+                    prune_losses.append(pred.sum() * 0)
+                    continue
+                pred = pred.clamp(min=1e-4, max=1 - 1e-4)
+                target = target.float().clamp(min=0, max=1)
+                bce = F.binary_cross_entropy(pred, target, reduction='none')
+                pos_mask = target > 0
+                if pos_mask.any():
+                    pos_loss = bce[pos_mask].mean()
+                    if (~pos_mask).any():
+                        neg_loss = bce[~pos_mask].mean()
+                    else:
+                        neg_loss = bce.sum() * 0
+                    prune_losses.append(pos_loss + 0.25 * neg_loss)
+                else:
+                    prune_losses.append(bce.mean())
+        if len(prune_losses) == 0:
+            return None, None
+        gaussian_prune_loss = sum(prune_losses) / len(prune_losses)
+        gaussian_prune_loss = self.gaussian_loss_weight * gaussian_prune_loss
+
+        if gaussian_regularizers is not None and len(gaussian_regularizers) > 0:
+            gaussian_primitive_loss = sum(gaussian_regularizers) / len(gaussian_regularizers)
+            gaussian_primitive_loss = self.gaussian_primitive_loss_weight * gaussian_primitive_loss
+        else:
+            gaussian_primitive_loss = gaussian_prune_loss * 0
+        return gaussian_prune_loss, gaussian_primitive_loss
+
+
     def _loss(self, bbox_preds, cls_preds, points,
               gt_bboxes, gt_labels, img_metas, keep_preds, keep_gts,
-              gaussian_gts, bboxes_level):
+              gaussian_preds, gaussian_targets, gaussian_regularizers, bboxes_level):
         bbox_losses, cls_losses, pos_masks = [], [], []
 
         #keep loss
@@ -544,19 +721,15 @@ class DSPHead(BaseModule):
             k_loss = 0
             keep_pred = [x[i] for x in keep_preds]
             keep_gt = [x[i] for x in keep_gts]
-            gaussian_gt = [x[i] for x in gaussian_gts] if gaussian_gts is not None else None
             for j in range(len(keep_preds)):
                 pred = keep_pred[j]
                 gt = (keep_gt[j]).long()
-                weight = None
-                if gaussian_gt is not None and self.gaussian_loss_weight > 0:
-                    weight = 1 + self.gaussian_loss_weight * gaussian_gt[j]
 
                 if gt.sum() != 0:
-                    keep_loss = self.keep_loss(pred, gt, weight=weight, avg_factor=gt.sum())
+                    keep_loss = self.keep_loss(pred, gt, avg_factor=gt.sum())
                     k_loss = torch.mean(keep_loss) / 3 + k_loss
                 else:
-                    keep_loss = self.keep_loss(pred, gt, weight=weight, avg_factor=len(gt))
+                    keep_loss = self.keep_loss(pred, gt, avg_factor=len(gt))
                     k_loss = torch.mean(keep_loss) / 3 + k_loss
 
             keep_losses = keep_losses + k_loss
@@ -580,20 +753,29 @@ class DSPHead(BaseModule):
         else:
             bbox_loss = sum(x.sum() for x in cls_losses) * 0
         pos_count = torch.sum(torch.cat(pos_masks)).clamp(min=1)
-        sigma_reg = 0
-        if self.gaussian_pruning_enabled and self.gaussian_learnable_sigma:
-            sigma_reg = self.gaussian_sigma_logits.sum() * 0
-        return dict(
+        losses = dict(
             bbox_loss=bbox_loss,
             cls_loss=torch.sum(torch.cat(cls_losses)) / pos_count,
-            keep_loss=0.01 * keep_losses / len(img_metas) + sigma_reg)
+            keep_loss=0.01 * keep_losses / len(img_metas))
+
+        if self.gaussian_pruning_enabled:
+            gaussian_prune_loss, gaussian_primitive_loss = self._gaussian_loss(
+                gaussian_preds, gaussian_targets, gaussian_regularizers)
+            if gaussian_prune_loss is not None:
+                losses['gaussian_prune_loss'] = gaussian_prune_loss
+            if gaussian_primitive_loss is not None:
+                losses['gaussian_primitive_loss'] = gaussian_primitive_loss
+        return losses
 
 
     def forward_train(self, x, gt_bboxes, gt_labels, img_metas):
-        bbox_preds, cls_preds, points, keep_preds, keep_gts, gaussian_gts, bboxes_level = self(x, gt_bboxes, gt_labels, img_metas)
+        (bbox_preds, cls_preds, points, keep_preds, keep_gts,
+         gaussian_preds, gaussian_targets, gaussian_regularizers,
+         bboxes_level) = self(x, gt_bboxes, gt_labels, img_metas)
         return self._loss(bbox_preds, cls_preds, points,
                           gt_bboxes, gt_labels, img_metas, keep_preds, keep_gts,
-                          gaussian_gts, bboxes_level)
+                          gaussian_preds, gaussian_targets, gaussian_regularizers,
+                          bboxes_level)
 
 
     def _nms(self, bboxes, scores, img_meta):
@@ -695,8 +877,8 @@ class DSPHead(BaseModule):
         keep_scores = None
         for i in range(len(inputs) - 1, -1, -1):
             if i < len(inputs) - 1:
-                x = self._prune_inference(x, prune_inference)
-                if x != None:
+                if self.gaussian_pruning_enabled:
+                    gaussian_params = self._predict_gaussian_primitives(x, i)
                     x = self.__getattr__(f'up_block_{i + 1}')(x)
                     coords = x.coordinates.float()
                     x_level_features = inputs[i].features_at_coordinates(coords)
@@ -704,8 +886,21 @@ class DSPHead(BaseModule):
                                               coordinate_map_key=x.coordinate_map_key,
                                               coordinate_manager=x.coordinate_manager)
                     x = x + x_level
+                    gaussian_keep_prob, _ = self._evaluate_gaussian_field(
+                        x, gaussian_params, i + 2)
+                    x = self._prune_by_gaussian(x, gaussian_keep_prob)
                 else:
-                    break
+                    x = self._prune_inference(x, prune_inference)
+                    if x != None:
+                        x = self.__getattr__(f'up_block_{i + 1}')(x)
+                        coords = x.coordinates.float()
+                        x_level_features = inputs[i].features_at_coordinates(coords)
+                        x_level = ME.SparseTensor(features=x_level_features,
+                                                  coordinate_map_key=x.coordinate_map_key,
+                                                  coordinate_manager=x.coordinate_manager)
+                        x = x + x_level
+                    else:
+                        break
 
             if i > 0:
                 keep_scores = self.keep_conv[i-1](x)
@@ -743,7 +938,7 @@ class DSPAssigner:
         boxes = torch.cat((gt_bboxes.gravity_center, gt_bboxes.tensor[:, 3:]), dim=1)
         boxes = boxes.to(points.device).expand(n_points, n_boxes, 7)
         points = points.unsqueeze(1).expand(n_points, n_boxes, 3)
-           
+
         # condition 1: fix level for label
         bboxes_level = bboxes_level.squeeze(1)
         label_levels = bboxes_level.unsqueeze(0).expand(n_points, n_boxes).to(points.device)
@@ -755,7 +950,7 @@ class DSPAssigner:
         center_distances = torch.sum(torch.pow(center - points, 2), dim=-1)
         ######3X3X3 limit
         L0 = 0.01 * 2**2
-        p = 7   
+        p = 7
         level_box_l = p * (L0 * 2 ** bboxes_level).unsqueeze(0).expand(n_points, n_boxes).unsqueeze(2).to(points.device)
         level_box = torch.cat((center,level_box_l),dim=2)
         shift = torch.stack((
