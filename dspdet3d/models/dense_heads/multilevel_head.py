@@ -67,6 +67,8 @@ class DSPHead(BaseModule):
         self.gaussian_mean_offset_scale = gaussian_pruning.get('mean_offset_scale', 1.5)
         self.gaussian_target_edge_prob = gaussian_pruning.get('target_edge_prob', 0.5)
         self.gaussian_chunk_size = max(1, int(gaussian_pruning.get('chunk_size', 65536)))
+        self.gaussian_fusion_weight = min(
+            1.0, max(0.0, float(gaussian_pruning.get('fusion_weight', 0.5))))
         self.current_epoch = 0
         self.assigner = build_assigner(assigner)
         self.bbox_loss = build_loss(bbox_loss)
@@ -275,6 +277,19 @@ class DSPHead(BaseModule):
         return keep_prob, regularizer
 
 
+    def _baseline_keep_prob(self, x, keep_scores):
+        coords = x.coordinates.float()
+        keep_logits = keep_scores.features_at_coordinates(coords).squeeze(1)
+        return torch.sigmoid(-keep_logits)
+
+
+    def _fuse_gaussian_keep_prob(self, x, keep_scores, gaussian_keep_prob):
+        baseline_keep_prob = self._baseline_keep_prob(x, keep_scores)
+        weight = gaussian_keep_prob.new_tensor(self.gaussian_fusion_weight)
+        keep_prob = (1 - weight) * baseline_keep_prob + weight * gaussian_keep_prob
+        return keep_prob.clamp(min=0, max=1)
+
+
     def _make_gaussian_prune_mask(self, keep_prob, x):
         with torch.no_grad():
             prune_mask = keep_prob.new_zeros((len(keep_prob),), dtype=torch.bool)
@@ -380,7 +395,9 @@ class DSPHead(BaseModule):
                     if self._gaussian_warmup_active():
                         x = self._prune_training(x, prune_training_keep)
                     else:
-                        x = self._prune_by_gaussian(x, gaussian_keep_prob)
+                        fused_keep_prob = self._fuse_gaussian_keep_prob(
+                            x, keep_scores, gaussian_keep_prob)
+                        x = self._prune_by_gaussian(x, fused_keep_prob)
                 else:
                     x = self._prune_training(x, prune_training_keep)
 
@@ -888,7 +905,9 @@ class DSPHead(BaseModule):
                     x = x + x_level
                     gaussian_keep_prob, _ = self._evaluate_gaussian_field(
                         x, gaussian_params, i + 2)
-                    x = self._prune_by_gaussian(x, gaussian_keep_prob)
+                    fused_keep_prob = self._fuse_gaussian_keep_prob(
+                        x, keep_scores, gaussian_keep_prob)
+                    x = self._prune_by_gaussian(x, fused_keep_prob)
                 else:
                     x = self._prune_inference(x, prune_inference)
                     if x != None:

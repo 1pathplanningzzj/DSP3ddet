@@ -37,7 +37,8 @@ model = dict(
             sigma_max=2.0,
             mean_offset_scale=1.5,
             target_edge_prob=0.5,
-            chunk_size=65536),
+            chunk_size=65536,
+            fusion_weight=0.2),
         bbox_loss=dict(type='AxisAlignedIoULoss2', mode='diou', reduction='none')),
     train_cfg=dict(),
     test_cfg=dict(nms_pre=1000, iou_thr=.5, score_thr=.01))

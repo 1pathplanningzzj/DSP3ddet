@@ -742,42 +742,23 @@ tail -f work_dirs/scannet_md40_gaussian_soft_2gpu_bs8/nohup_train.log
 
 
 
-cd /home/czy22/zzj/DSPDet3D
-
-mkdir -p work_dirs/scannet_md40_gaussian_soft_2gpu_bs8
-
-nohup bash -c '
-set -e
-eval "$(/data/czy22/anaconda3/bin/python /data/czy22/anaconda3/bin/conda shell.bash hook)"
-conda activate /data/czy22/anaconda3/envs/dspdet3d
-
-export LD_LIBRARY_PATH=/data/czy22/anaconda3/envs/dspdet3d/lib:$LD_LIBRARY_PATH
-export PYTHONPATH=/home/czy22/zzj/DSPDet3D:$PYTHONPATH
-export OMP_NUM_THREADS=12
-
-PORT=29502 CUDA_VISIBLE_DEVICES=0,1 bash tools/dist_train.sh \
+cd /home/czy22/zzj/DSPDet3D && \
+mkdir -p work_dirs/scannet_baseline_1gpu_bs4_gpu2 && \
+CUDA_VISIBLE_DEVICES=2 \
+PYTHONPATH=/home/czy22/zzj/DSPDet3D:$PYTHONPATH \
+OMP_NUM_THREADS=12 \
+nohup /data/czy22/anaconda3/envs/dspdet3d/bin/python tools/train.py \
   configs/dspdet3d/dspdet3d_scannet-3d-22class.py \
-  2 \
-  --work-dir work_dirs/scannet_md40_gaussian_soft_2gpu_bs8 \
+  --seed 0 \
+  --work-dir work_dirs/scannet_baseline_1gpu_bs4_gpu2 \
   --cfg-options \
-  data.samples_per_gpu=8 \
-  model.head.gaussian_pruning.enabled=True \
-  model.head.gaussian_pruning.mode=soft \
-  model.head.gaussian_pruning.num_primitives=1 \
-  model.head.gaussian_pruning.mean_offset_scale=1.5 \
-  model.head.gaussian_pruning.soft_score_floor=0.1 \
-  model.head.gaussian_pruning.soft_loss_weight=0.05 \
-  model.head.gaussian_pruning.soft_train=True \
-  model.head.gaussian_pruning.soft_test=False \
-  model.head.gaussian_pruning.soft_apply_before_prune=True \
-  model.head.gaussian_pruning.learnable_sigma=False \
-  model.head.gaussian_pruning.guide_train_topk=False \
-  model.head.gaussian_pruning.train_score_weight=0.0 \
-  model.head.gaussian_pruning.loss_weight=0.0 \
+  model.head.gaussian_pruning.enabled=False \
+  data.samples_per_gpu=4 \
+  data.workers_per_gpu=4 \
   data.train.dataset.data_root=data/ScanNet-md40/mmdet_scannet/ \
   data.train.dataset.ann_file=data/ScanNet-md40/mmdet_scannet/scannet_infos_train.pkl \
   data.val.data_root=data/ScanNet-md40/mmdet_scannet/ \
   data.val.ann_file=data/ScanNet-md40/mmdet_scannet/scannet_infos_val.pkl \
   data.test.data_root=data/ScanNet-md40/mmdet_scannet/ \
-  data.test.ann_file=data/ScanNet-md40/mmdet_scannet/scannet_infos_val.pkl
-' > work_dirs/scannet_md40_gaussian_soft_2gpu_bs8/nohup_train.log 2>&1 &
+  data.test.ann_file=data/ScanNet-md40/mmdet_scannet/scannet_infos_val.pkl \
+  > work_dirs/scannet_baseline_1gpu_bs4_gpu2/nohup_train.log 2>&1 &
