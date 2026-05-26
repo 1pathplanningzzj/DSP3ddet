@@ -762,3 +762,45 @@ nohup /data/czy22/anaconda3/envs/dspdet3d/bin/python tools/train.py \
   data.test.data_root=data/ScanNet-md40/mmdet_scannet/ \
   data.test.ann_file=data/ScanNet-md40/mmdet_scannet/scannet_infos_val.pkl \
   > work_dirs/scannet_baseline_1gpu_bs4_gpu2/nohup_train.log 2>&1 &
+
+## 13. 3D-GMM 单卡 0 号卡 bs4 启动
+
+当前这版把实验参数都写在 `configs/dspdet3d/dspdet3d_scannet-3d-22class.py` 里：
+
+```python
+n_points = 30000
+model.head.gaussian_pruning.enabled = True
+data_root = 'data/ScanNet-md40/mmdet_scannet/'
+data.samples_per_gpu = 4
+data.workers_per_gpu = 2
+work_dir = 'work_dirs/scannet_md40_3dgmm_1gpu_bs4'
+log_config.interval = 1
+```
+
+启动命令保持简单，不再额外传一堆 `--cfg-options`：
+
+```bash
+cd /home/czy22/zzj/DSPDet3D
+
+mkdir -p work_dirs/scannet_md40_3dgmm_1gpu_bs4
+
+nohup bash -c '
+set -e
+export PATH=/data/czy22/anaconda3/envs/dspdet3d/bin:$PATH
+export LD_LIBRARY_PATH=/data/czy22/anaconda3/envs/dspdet3d/lib:$LD_LIBRARY_PATH
+export PYTHONPATH=/home/czy22/zzj/DSPDet3D:$PYTHONPATH
+export OMP_NUM_THREADS=12
+export TORCH_DISTRIBUTED_DEBUG=DETAIL
+
+CUDA_VISIBLE_DEVICES=0 bash tools/dist_train.sh \
+  configs/dspdet3d/dspdet3d_scannet-3d-22class.py \
+  1
+' > work_dirs/scannet_md40_3dgmm_1gpu_bs4/nohup_train.log 2>&1 &
+```
+
+查看日志和显存：
+
+```bash
+tail -f work_dirs/scannet_md40_3dgmm_1gpu_bs4/nohup_train.log
+nvidia-smi
+```

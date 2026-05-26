@@ -35,10 +35,10 @@ class DSPHead(BaseModule):
                  r,
                  assign_type='volume',
                  prune_threshold=0,
+                 gaussian_pruning=None,
                  bbox_loss=dict(type='AxisAlignedIoULoss', reduction='none'),
                  cls_loss=dict(type='FocalLoss', reduction='none'),
                  keep_loss=dict(type='FocalLoss', reduction='mean', use_sigmoid=True),
-                 gaussian_pruning=None,
                  train_cfg=None,
                  test_cfg=None):
         super(DSPHead, self).__init__()
@@ -48,35 +48,48 @@ class DSPHead(BaseModule):
         self.volume_threshold = volume_threshold
         self.r = r
         self.prune_threshold = prune_threshold
-        gaussian_pruning = gaussian_pruning or {}
-        self.gaussian_pruning_enabled = gaussian_pruning.get('enabled', False)
-        self.gaussian_num_primitives = max(
-            1, int(gaussian_pruning.get('num_primitives', 1)))
-        self.gaussian_projection = gaussian_pruning.get('projection', 'nearest')
-        self.gaussian_keep_threshold = gaussian_pruning.get('keep_threshold', 0.5)
-        self.gaussian_min_keep = max(0, int(gaussian_pruning.get('min_keep', 1000)))
-        self.gaussian_max_keep = max(0, int(gaussian_pruning.get('max_keep', 100000)))
-        self.gaussian_warmup_epochs = max(
-            0, int(gaussian_pruning.get('warmup_epochs', 1)))
-        self.gaussian_loss_weight = gaussian_pruning.get('loss_weight', 0.01)
-        self.gaussian_primitive_loss_weight = gaussian_pruning.get(
-            'primitive_loss_weight', 0.0)
-        self.gaussian_sigma_scale = gaussian_pruning.get('sigma_scale', 0.5)
-        self.gaussian_sigma_min = gaussian_pruning.get('sigma_min', 0.1)
-        self.gaussian_sigma_max = gaussian_pruning.get('sigma_max', 2.0)
-        self.gaussian_mean_offset_scale = gaussian_pruning.get('mean_offset_scale', 1.5)
-        self.gaussian_target_edge_prob = gaussian_pruning.get('target_edge_prob', 0.5)
-        self.gaussian_chunk_size = max(1, int(gaussian_pruning.get('chunk_size', 65536)))
-        self.gaussian_fusion_weight = min(
-            1.0, max(0.0, float(gaussian_pruning.get('fusion_weight', 0.5))))
-        self.current_epoch = 0
         self.assigner = build_assigner(assigner)
         self.bbox_loss = build_loss(bbox_loss)
         self.cls_loss = build_loss(cls_loss)
         self.keep_loss = build_loss(keep_loss)
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
+        self.current_epoch = 0
+        self._init_gaussian_pruning(gaussian_pruning)
         self._init_layers(in_channels, out_channels, n_reg_outs, n_classes)
+        self._freeze_inactive_pruning_heads()
+
+
+    def _init_gaussian_pruning(self, gaussian_pruning):
+        gaussian_pruning = gaussian_pruning or {}
+        self.gaussian_pruning_enabled = gaussian_pruning.get('enabled', False)
+        self.gmm_num_primitives = gaussian_pruning.get('num_primitives', 1)
+        self.gmm_keep_threshold = gaussian_pruning.get('keep_threshold', self.prune_threshold)
+        self.gmm_min_keep = gaussian_pruning.get('min_keep', 1)
+        self.gmm_max_keep = gaussian_pruning.get('max_keep', self.pts_prune_threshold)
+        self.gmm_warmup_epochs = gaussian_pruning.get('warmup_epochs', 0)
+        self.gmm_chunk_size = gaussian_pruning.get('chunk_size', 512)
+        self.gmm_knn_k = gaussian_pruning.get('knn_k', 8)
+        self.gmm_neighbor_backend = gaussian_pruning.get('neighbor_backend', 'cdist')
+        self.gmm_local_window_radius = gaussian_pruning.get('local_window_radius', 1)
+        self.gmm_local_cell_size_scale = gaussian_pruning.get('local_cell_size_scale', 1.0)
+        self.gmm_local_dense_max_cells = gaussian_pruning.get('local_dense_max_cells', 2000000)
+        self.gmm_local_fallback = gaussian_pruning.get('local_fallback', 'none')
+        self.gmm_local_fallback_radius = gaussian_pruning.get('local_fallback_radius', self.gmm_local_window_radius)
+        self.gmm_train_gate_floor = gaussian_pruning.get('train_gate_floor', 0.05)
+        self.gmm_scale_min = gaussian_pruning.get('scale_min', gaussian_pruning.get('sigma_min', 0.1))
+        self.gmm_scale_max = gaussian_pruning.get('scale_max', gaussian_pruning.get('sigma_max', 2.0))
+        self.gmm_volume_loss_weight = gaussian_pruning.get('volume_loss_weight', 0.005)
+        self.gmm_sparsity_loss_weight = gaussian_pruning.get('opacity_sparsity_loss_weight', 0.01)
+        self.gmm_loss_weight = gaussian_pruning.get('gmm_loss_weight', gaussian_pruning.get('loss_weight', 0.01))
+
+
+    def _freeze_inactive_pruning_heads(self):
+        inactive_heads = [self.keep_conv] if self.gaussian_pruning_enabled else [
+            self.opacity_conv, self.scale_conv, self.rot_conv]
+        for heads in inactive_heads:
+            for parameter in heads.parameters():
+                parameter.requires_grad = False
 
 
     @staticmethod
@@ -118,19 +131,24 @@ class DSPHead(BaseModule):
         self.cls_conv = ME.MinkowskiConvolution(
             out_channels, n_classes, kernel_size=1, bias=True, dimension=3)
         self.keep_conv = nn.ModuleList([
-            ME.MinkowskiConvolution(out_channels, 1, kernel_size=1, bias=True, dimension=3),
-            ME.MinkowskiConvolution(out_channels, 1, kernel_size=1, bias=True, dimension=3),
-            ME.MinkowskiConvolution(out_channels, 1, kernel_size=1, bias=True, dimension=3)
+            ME.MinkowskiConvolution(in_channels[i + 1], 1, kernel_size=1, bias=True, dimension=3)
+            for i in range(len(in_channels) - 1)
         ])
-        if self.gaussian_pruning_enabled:
-            self.gaussian_param_conv = nn.ModuleList([
-                ME.MinkowskiConvolution(
-                    in_channels[i], self.gaussian_num_primitives * 5,
-                    kernel_size=1, bias=True, dimension=3)
-                for i in range(1, len(in_channels))
-            ])
-        else:
-            self.gaussian_param_conv = None
+        self.opacity_conv = nn.ModuleList([
+            ME.MinkowskiConvolution(
+                in_channels[i + 1], self.gmm_num_primitives, kernel_size=1, bias=True, dimension=3)
+            for i in range(len(in_channels) - 1)
+        ])
+        self.scale_conv = nn.ModuleList([
+            ME.MinkowskiConvolution(
+                in_channels[i + 1], self.gmm_num_primitives * 3, kernel_size=1, bias=True, dimension=3)
+            for i in range(len(in_channels) - 1)
+        ])
+        self.rot_conv = nn.ModuleList([
+            ME.MinkowskiConvolution(
+                in_channels[i + 1], self.gmm_num_primitives * 4, kernel_size=1, bias=True, dimension=3)
+            for i in range(len(in_channels) - 1)
+        ])
         self.pruning = ME.MinkowskiPruning()
 
         for i in range(len(in_channels)):
@@ -158,19 +176,19 @@ class DSPHead(BaseModule):
 
         for i in range(len(self.keep_conv)):
             nn.init.normal_(self.keep_conv[i].kernel, std=.01)
-
-        if self.gaussian_param_conv is not None:
-            for conv in self.gaussian_param_conv:
-                nn.init.normal_(conv.kernel, std=.01)
-                if conv.bias is not None:
-                    with torch.no_grad():
-                        conv.bias.zero_()
-                        bias = conv.bias.view(self.gaussian_num_primitives, 5)
-                        bias[:, 4] = bias_init_with_prob(.8)
+            nn.init.normal_(self.opacity_conv[i].kernel, std=.01)
+            nn.init.constant_(self.opacity_conv[i].bias, bias_init_with_prob(.8))
+            nn.init.normal_(self.scale_conv[i].kernel, std=.01)
+            nn.init.constant_(self.scale_conv[i].bias, 0)
+            nn.init.normal_(self.rot_conv[i].kernel, std=.01)
+            nn.init.constant_(self.rot_conv[i].bias, 0)
+            with torch.no_grad():
+                self.rot_conv[i].bias.view(-1)[0::4].fill_(1)
 
         for n, m in self.named_modules():
             if ('bbox_conv' not in n) and ('cls_conv' not in n) \
-                and ('keep_conv' not in n) and ('gaussian_param_conv' not in n) \
+                and ('keep_conv' not in n) and ('opacity_conv' not in n) \
+                and ('scale_conv' not in n) and ('rot_conv' not in n) \
                 and ('loss' not in n):
                 if isinstance(m, ME.MinkowskiConvolution):
                     ME.utils.kaiming_normal_(
@@ -201,125 +219,370 @@ class DSPHead(BaseModule):
         return bbox_preds, cls_preds, points, prune_training
 
 
-    def _level_half_window(self, cur_level):
-        l0 = self.voxel_size * 2 ** 2
-        return (self.r * l0 * 2 ** (cur_level - 1)) / 2
+    def _sparse_like(self, x, features):
+        return ME.SparseTensor(
+            features=features,
+            coordinate_map_key=x.coordinate_map_key,
+            coordinate_manager=x.coordinate_manager)
 
 
-    def _gaussian_warmup_active(self):
-        return self.training and self.current_epoch < self.gaussian_warmup_epochs
+    def _gmm_level_spacing(self, transition_idx):
+        return self.voxel_size * (2 ** (transition_idx + 2))
 
 
-    def _predict_gaussian_primitives(self, x, transition_idx):
-        if self.gaussian_param_conv is None:
-            return None
-        return self.gaussian_param_conv[transition_idx](x)
+    @staticmethod
+    def _quaternion_to_matrix(rotation):
+        rot = F.normalize(rotation, dim=-1, eps=1e-6)
+        r, x, y, z = rot.unbind(dim=-1)
+        matrix = torch.stack([
+            1 - 2 * (y ** 2 + z ** 2),
+            2 * (x * y - r * z),
+            2 * (x * z + r * y),
+            2 * (x * y + r * z),
+            1 - 2 * (x ** 2 + z ** 2),
+            2 * (y * z - r * x),
+            2 * (x * z - r * y),
+            2 * (y * z + r * x),
+            1 - 2 * (x ** 2 + y ** 2)
+        ], dim=-1)
+        return matrix.reshape(rotation.shape[:-1] + (3, 3))
 
 
-    def _evaluate_gaussian_field(self, target_x, source_params, cur_level):
-        if source_params is None:
-            return None, target_x.features.sum() * 0
-        if self.gaussian_projection != 'nearest':
-            raise NotImplementedError(
-                f'Unsupported gaussian projection: {self.gaussian_projection}')
+    def _compute_covariance_3d(self, scaling, rotation):
+        scale = torch.exp(scaling)
+        rot = self._quaternion_to_matrix(rotation)
+        scale_matrix = torch.diag_embed(scale)
+        transform = rot @ scale_matrix
+        sigma = transform @ transform.transpose(-1, -2)
+        eye = torch.eye(3, device=sigma.device, dtype=sigma.dtype).view(1, 3, 3)
+        sigma_inv = torch.inverse(sigma + 1e-6 * eye)
+        return sigma, sigma_inv
 
+
+    def _decode_gmm_params(self, x, transition_idx):
+        n_primitives = self.gmm_num_primitives
+        opacity = torch.sigmoid(self.opacity_conv[transition_idx](x).features)
+        scale_logits = self.scale_conv[transition_idx](x).features.reshape(-1, n_primitives, 3)
+        rotation = self.rot_conv[transition_idx](x).features.reshape(-1, n_primitives, 4)
+        scale = self.gmm_scale_min + (self.gmm_scale_max - self.gmm_scale_min) * torch.sigmoid(scale_logits)
+        scale = scale * self._gmm_level_spacing(transition_idx)
+        return dict(
+            coords=x.coordinates[:, 1:].float() * self.voxel_size,
+            permutations=x.decomposition_permutations,
+            opacity=opacity.reshape(-1, n_primitives),
+            scale=scale,
+            rotation=self._quaternion_to_matrix(rotation),
+            spacing=x.features.new_tensor(self._gmm_level_spacing(transition_idx)))
+
+
+    def _gmm_regularizers(self, gmm_params):
+        opacity = gmm_params['opacity']
+        scale = gmm_params['scale']
+        spacing = gmm_params['spacing']
+        volume = torch.prod(scale / spacing.clamp_min(1e-6), dim=-1).mean()
+        opacity_entropy = -(opacity * torch.log(opacity + 1e-6) +
+                            (1 - opacity) * torch.log(1 - opacity + 1e-6)).mean()
+        return volume, opacity_entropy
+
+
+    def _score_gmm_neighbors(self, target_coords, nn_coords, nn_opacity,
+                             nn_scale, nn_rotation, valid_mask=None):
+        delta = target_coords[:, None, None, :] - nn_coords[:, :, None, :]
+        delta = delta.expand(-1, -1, self.gmm_num_primitives, -1)
+        delta_local = torch.matmul(
+            nn_rotation.transpose(-1, -2), delta.unsqueeze(-1)).squeeze(-1)
+        dist = torch.sum((delta_local / nn_scale.clamp_min(1e-6)) ** 2, dim=-1)
+        scores = nn_opacity * torch.exp(-0.5 * dist)
+        if valid_mask is not None:
+            scores = scores * valid_mask.unsqueeze(-1)
+        return scores.reshape(len(target_coords), -1).max(dim=1).values
+
+
+    def _evaluate_gmm_field_cdist(self, target_x, gmm_params):
         keep_prob = target_x.features.new_zeros((len(target_x.features),))
-        regularizer = target_x.features.sum() * 0
-        if len(target_x.features) == 0:
-            return keep_prob, regularizer
+        opacity = gmm_params['opacity']
+        scale = gmm_params['scale']
+        rotation = gmm_params['rotation']
+        source_coords = gmm_params['coords']
+        chunk_size = max(int(self.gmm_chunk_size), 1)
 
-        source_valid = ME.SparseTensor(
-            source_params.features.new_ones((len(source_params.features), 1)),
-            coordinate_map_key=source_params.coordinate_map_key,
-            coordinate_manager=source_params.coordinate_manager)
-        source_centers = ME.SparseTensor(
-            source_params.coordinates[:, 1:].float() * self.voxel_size,
-            coordinate_map_key=source_params.coordinate_map_key,
-            coordinate_manager=source_params.coordinate_manager)
-
-        coords = target_x.coordinates.float()
-        target_points = target_x.coordinates[:, 1:].float() * self.voxel_size
-        half_window = target_x.features.new_tensor(self._level_half_window(cur_level))
-        sigma_base = torch.clamp(
-            target_x.features.new_tensor(self.gaussian_sigma_scale) * half_window,
-            min=1e-6)
-        sigma_range = self.gaussian_sigma_max - self.gaussian_sigma_min
-        n_chunks = 0
-
-        for start in range(0, len(target_x.features), self.gaussian_chunk_size):
-            end = min(start + self.gaussian_chunk_size, len(target_x.features))
-            query_coords = coords[start:end]
-            raw = source_params.features_at_coordinates(query_coords)
-            valid = source_valid.features_at_coordinates(query_coords).squeeze(1) > 0
-            centers = source_centers.features_at_coordinates(query_coords)
-            raw = raw.view(-1, self.gaussian_num_primitives, 5)
-
-            offset = torch.tanh(raw[..., :3]) * self.gaussian_mean_offset_scale * half_window
-            sigma_scale = self.gaussian_sigma_min + sigma_range * torch.sigmoid(raw[..., 3])
-            sigma = torch.clamp(sigma_base * sigma_scale, min=1e-6)
-            amplitude = torch.sigmoid(raw[..., 4])
-            mu = centers[:, None, :] + offset
-            distance = ((target_points[start:end, None, :] - mu) ** 2).sum(dim=-1)
-            primitive_scores = amplitude * torch.exp(-0.5 * distance / (sigma ** 2))
-            score = primitive_scores.max(dim=1).values.clamp(min=0, max=1)
-            score = torch.where(valid, score, score.new_zeros(score.shape))
-            keep_prob[start:end] = torch.nan_to_num(
-                score, nan=0.0, posinf=1.0, neginf=0.0)
-
-            if valid.any():
-                regularizer = regularizer + amplitude[valid].mean()
-            else:
-                regularizer = regularizer + amplitude.sum() * 0
-            n_chunks += 1
-
-        if n_chunks > 0:
-            regularizer = regularizer / n_chunks
-        return keep_prob, regularizer
+        for source_perm, target_perm in zip(gmm_params['permutations'], target_x.decomposition_permutations):
+            if len(source_perm) == 0 or len(target_perm) == 0:
+                continue
+            scene_source_coords = source_coords[source_perm]
+            scene_opacity = opacity[source_perm]
+            scene_scale = scale[source_perm]
+            scene_rotation = rotation[source_perm]
+            scene_target_coords = target_x.coordinates[target_perm][:, 1:].float() * self.voxel_size
+            k = min(int(self.gmm_knn_k), len(scene_source_coords))
+            for start in range(0, len(scene_target_coords), chunk_size):
+                end = min(start + chunk_size, len(scene_target_coords))
+                target_chunk = scene_target_coords[start:end]
+                nn_ids = torch.cdist(target_chunk, scene_source_coords).topk(
+                    k, largest=False, sorted=False).indices
+                keep_prob[target_perm[start:end]] = self._score_gmm_neighbors(
+                    target_chunk,
+                    scene_source_coords[nn_ids],
+                    scene_opacity[nn_ids],
+                    scene_scale[nn_ids],
+                    scene_rotation[nn_ids])
+        return keep_prob
 
 
-    def _baseline_keep_prob(self, x, keep_scores):
-        coords = x.coordinates.float()
-        keep_logits = keep_scores.features_at_coordinates(coords).squeeze(1)
-        return torch.sigmoid(-keep_logits)
+    def _gmm_local_offsets(self, radius, device):
+        radius = max(int(radius), 0)
+        values = torch.arange(-radius, radius + 1, device=device, dtype=torch.long)
+        offsets = torch.meshgrid(values, values, values, indexing='ij')
+        return torch.stack([offset.reshape(-1) for offset in offsets], dim=1)
 
 
-    def _fuse_gaussian_keep_prob(self, x, keep_scores, gaussian_keep_prob):
-        baseline_keep_prob = self._baseline_keep_prob(x, keep_scores)
-        weight = gaussian_keep_prob.new_tensor(self.gaussian_fusion_weight)
-        keep_prob = (1 - weight) * baseline_keep_prob + weight * gaussian_keep_prob
-        return keep_prob.clamp(min=0, max=1)
+    @staticmethod
+    def _linearize_gmm_cells(cells, min_cell, strides):
+        return ((cells - min_cell) * strides).sum(dim=-1)
 
 
-    def _make_gaussian_prune_mask(self, keep_prob, x):
-        with torch.no_grad():
-            prune_mask = keep_prob.new_zeros((len(keep_prob),), dtype=torch.bool)
-            for permutation in x.decomposition_permutations:
-                if len(permutation) == 0:
-                    continue
-                score = keep_prob[permutation]
-                keep = score >= self.gaussian_keep_threshold
-                if self.gaussian_max_keep > 0 and keep.sum() > self.gaussian_max_keep:
-                    topk = min(len(score), self.gaussian_max_keep)
-                    ids = torch.topk(score, topk, sorted=False).indices
-                    keep = torch.zeros_like(keep)
-                    keep[ids] = True
-                min_keep = min(len(score), self.gaussian_min_keep)
-                if min_keep > 0 and keep.sum() < min_keep:
-                    ids = torch.topk(score, min_keep, sorted=False).indices
-                    keep = torch.zeros_like(keep)
-                    keep[ids] = True
-                if keep.sum() == 0:
-                    ids = torch.topk(score, 1, sorted=False).indices
-                    keep[ids] = True
-                prune_mask[permutation[keep]] = True
+    def _build_gmm_cell_lookup(self, source_cells, min_cell, grid_shape):
+        strides = torch.stack((grid_shape[1] * grid_shape[2],
+                               grid_shape[2],
+                               grid_shape.new_tensor(1)))
+        source_keys = self._linearize_gmm_cells(source_cells, min_cell, strides)
+        total_cells = int((grid_shape[0] * grid_shape[1] * grid_shape[2]).item())
+        sorted_keys, order = torch.sort(source_keys)
+        unique_keys, counts = torch.unique_consecutive(sorted_keys, return_counts=True)
+        cell_ids = torch.arange(len(unique_keys), device=source_keys.device)
+        max_sources_per_cell = int(counts.max().item()) if len(counts) > 0 else 0
+        cell_source_ids = order.new_full((len(unique_keys), max_sources_per_cell), -1)
+
+        if len(order) > 0:
+            cell_starts = counts.cumsum(dim=0) - counts
+            slot_ids = torch.arange(len(order), device=order.device) - torch.repeat_interleave(
+                cell_starts, counts)
+            repeated_cell_ids = torch.repeat_interleave(cell_ids, counts)
+            cell_source_ids[repeated_cell_ids, slot_ids] = order
+
+        if total_cells <= int(self.gmm_local_dense_max_cells):
+            dense_lookup = source_keys.new_full((total_cells,), -1)
+            dense_lookup[unique_keys] = cell_ids
+            return dict(
+                mode='dense',
+                dense_lookup=dense_lookup,
+                cell_source_ids=cell_source_ids,
+                strides=strides)
+
+        return dict(
+            mode='sorted',
+            sorted_keys=unique_keys,
+            cell_source_ids=cell_source_ids,
+            strides=strides)
+
+
+    def _gather_gmm_local_candidates(self, target_cells, offsets, min_cell,
+                                     grid_shape, lookup):
+        candidate_cells = target_cells[:, None, :] + offsets[None, :, :]
+        valid_cells = ((candidate_cells >= min_cell) &
+                       (candidate_cells < min_cell + grid_shape)).all(dim=-1)
+        clamped_cells = torch.max(torch.min(candidate_cells, min_cell + grid_shape - 1), min_cell)
+        candidate_keys = self._linearize_gmm_cells(clamped_cells, min_cell, lookup['strides'])
+
+        if lookup['mode'] == 'dense':
+            candidate_cell_ids = lookup['dense_lookup'][candidate_keys]
+        else:
+            flat_keys = candidate_keys.reshape(-1)
+            positions = torch.searchsorted(lookup['sorted_keys'], flat_keys)
+            in_range = positions < len(lookup['sorted_keys'])
+            safe_positions = positions.clamp(max=max(len(lookup['sorted_keys']) - 1, 0))
+            found = in_range & (lookup['sorted_keys'][safe_positions] == flat_keys)
+            flat_ids = flat_keys.new_full((len(flat_keys),), -1)
+            flat_ids[found] = safe_positions[found]
+            candidate_cell_ids = flat_ids.reshape(candidate_keys.shape)
+
+        valid_cells = valid_cells & (candidate_cell_ids >= 0)
+        if lookup['cell_source_ids'].numel() == 0:
+            return candidate_cell_ids.new_full(candidate_cell_ids.shape, -1)
+
+        safe_cell_ids = candidate_cell_ids.clamp_min(0)
+        candidate_ids = lookup['cell_source_ids'][safe_cell_ids]
+        candidate_ids = torch.where(
+            valid_cells.unsqueeze(-1),
+            candidate_ids,
+            candidate_ids.new_full((), -1))
+        return candidate_ids.reshape(len(target_cells), -1)
+
+
+    def _score_gmm_local_candidates(self, target_chunk, target_cells, scene_source_coords,
+                                    scene_opacity, scene_scale, scene_rotation,
+                                    offsets, min_cell, grid_shape, lookup):
+        local_ids = self._gather_gmm_local_candidates(
+            target_cells, offsets, min_cell, grid_shape, lookup)
+        valid_mask = local_ids >= 0
+        if not valid_mask.any():
+            return target_chunk.new_zeros((len(target_chunk),)), valid_mask.any(dim=1)
+
+        safe_ids = local_ids.clamp_min(0)
+        candidate_coords = scene_source_coords[safe_ids]
+        candidate_distances = torch.sum((candidate_coords - target_chunk[:, None, :]) ** 2, dim=-1)
+        candidate_distances = candidate_distances.masked_fill(~valid_mask, float('inf'))
+
+        k = min(int(self.gmm_knn_k), candidate_distances.shape[1])
+        if k > 0 and candidate_distances.shape[1] > k:
+            top_distances, top_ids = torch.topk(candidate_distances, k, largest=False, sorted=False)
+            local_ids = torch.gather(local_ids, 1, top_ids)
+            valid_mask = torch.gather(valid_mask, 1, top_ids) & torch.isfinite(top_distances)
+            safe_ids = local_ids.clamp_min(0)
+
+        scores = self._score_gmm_neighbors(
+            target_chunk,
+            scene_source_coords[safe_ids],
+            scene_opacity[safe_ids],
+            scene_scale[safe_ids],
+            scene_rotation[safe_ids],
+            valid_mask)
+        return scores, valid_mask.any(dim=1)
+
+
+    def _evaluate_gmm_field_local_window(self, target_x, gmm_params):
+        keep_prob = target_x.features.new_zeros((len(target_x.features),))
+        opacity = gmm_params['opacity']
+        scale = gmm_params['scale']
+        rotation = gmm_params['rotation']
+        source_coords = gmm_params['coords']
+        spacing = gmm_params['spacing']
+        chunk_size = max(int(self.gmm_chunk_size), 1)
+        primary_radius = max(int(self.gmm_local_window_radius), 0)
+        fallback_mode = self.gmm_local_fallback
+        fallback_radius = max(primary_radius, int(self.gmm_local_fallback_radius))
+        primary_offsets = self._gmm_local_offsets(primary_radius, target_x.features.device)
+        fallback_offsets = None
+        if fallback_mode in ('expand', 'nearest_missing') and fallback_radius > primary_radius:
+            fallback_offsets = self._gmm_local_offsets(fallback_radius, target_x.features.device)
+        elif fallback_mode not in ('none', None, 'expand', 'nearest_missing'):
+            raise ValueError(f'Unsupported GMM local fallback: {fallback_mode}')
+        cell_scale = max(float(self.gmm_local_cell_size_scale), 1e-6)
+        cell_size = (spacing * cell_scale).clamp_min(1e-6)
+
+        for source_perm, target_perm in zip(gmm_params['permutations'], target_x.decomposition_permutations):
+            if len(source_perm) == 0 or len(target_perm) == 0:
+                continue
+
+            scene_source_coords = source_coords[source_perm]
+            scene_opacity = opacity[source_perm]
+            scene_scale = scale[source_perm]
+            scene_rotation = rotation[source_perm]
+            scene_target_coords = target_x.coordinates[target_perm][:, 1:].float() * self.voxel_size
+            source_cells = torch.floor(scene_source_coords / cell_size).long()
+            target_cells = torch.floor(scene_target_coords / cell_size).long()
+            lookup_radius = fallback_radius if fallback_offsets is not None else primary_radius
+            min_cell = torch.min(source_cells.min(dim=0).values,
+                                 target_cells.min(dim=0).values) - lookup_radius
+            max_cell = torch.max(source_cells.max(dim=0).values,
+                                 target_cells.max(dim=0).values) + lookup_radius
+            grid_shape = max_cell - min_cell + 1
+            lookup = self._build_gmm_cell_lookup(source_cells, min_cell, grid_shape)
+
+            for start in range(0, len(scene_target_coords), chunk_size):
+                end = min(start + chunk_size, len(scene_target_coords))
+                target_chunk = scene_target_coords[start:end]
+                chunk_target_cells = target_cells[start:end]
+                chunk_scores, found_mask = self._score_gmm_local_candidates(
+                    target_chunk, chunk_target_cells, scene_source_coords,
+                    scene_opacity, scene_scale, scene_rotation, primary_offsets,
+                    min_cell, grid_shape, lookup)
+
+                if fallback_mode == 'expand' and fallback_offsets is not None:
+                    chunk_scores, found_mask = self._score_gmm_local_candidates(
+                        target_chunk, chunk_target_cells, scene_source_coords,
+                        scene_opacity, scene_scale, scene_rotation, fallback_offsets,
+                        min_cell, grid_shape, lookup)
+                elif fallback_mode == 'nearest_missing':
+                    missing_mask = ~found_mask
+                    if missing_mask.any() and fallback_offsets is not None:
+                        fallback_scores, fallback_found = self._score_gmm_local_candidates(
+                            target_chunk[missing_mask], chunk_target_cells[missing_mask],
+                            scene_source_coords, scene_opacity, scene_scale,
+                            scene_rotation, fallback_offsets, min_cell, grid_shape,
+                            lookup)
+                        chunk_scores = chunk_scores.clone()
+                        found_mask = found_mask.clone()
+                        chunk_scores[missing_mask] = fallback_scores
+                        found_mask[missing_mask] = fallback_found
+                        missing_mask = ~found_mask
+                    if missing_mask.any():
+                        k = min(max(int(self.gmm_knn_k), 1), len(scene_source_coords))
+                        nn_ids = torch.cdist(
+                            target_chunk[missing_mask], scene_source_coords).topk(
+                                k, largest=False, sorted=False).indices
+                        fallback_scores = self._score_gmm_neighbors(
+                            target_chunk[missing_mask],
+                            scene_source_coords[nn_ids],
+                            scene_opacity[nn_ids],
+                            scene_scale[nn_ids],
+                            scene_rotation[nn_ids])
+                        if chunk_scores.data_ptr() == keep_prob[target_perm[start:end]].data_ptr():
+                            chunk_scores = chunk_scores.clone()
+                        chunk_scores[missing_mask] = fallback_scores
+
+                keep_prob[target_perm[start:end]] = chunk_scores
+        return keep_prob
+
+
+    def _evaluate_gmm_field(self, target_x, gmm_params):
+        if self.gmm_neighbor_backend == 'cdist':
+            keep_prob = self._evaluate_gmm_field_cdist(target_x, gmm_params)
+        elif self.gmm_neighbor_backend in ('local_window', 'voxel_window'):
+            keep_prob = self._evaluate_gmm_field_local_window(target_x, gmm_params)
+        else:
+            raise ValueError(f'Unsupported GMM neighbor backend: {self.gmm_neighbor_backend}')
+
+        volume, opacity_entropy = self._gmm_regularizers(gmm_params)
+        return keep_prob.clamp(0, 1), volume, opacity_entropy
+
+
+    def _apply_gmm_training_gate(self, x, keep_prob):
+        if self.current_epoch < self.gmm_warmup_epochs:
+            gate = torch.ones_like(keep_prob)
+        else:
+            gate = self.gmm_train_gate_floor + (1 - self.gmm_train_gate_floor) * keep_prob
+        return self._sparse_like(x, x.features * gate.unsqueeze(1))
+
+
+    def _make_gmm_prune_mask(self, x, keep_prob):
+        prune_mask = keep_prob.new_zeros((len(keep_prob),), dtype=torch.bool)
+        for permutation in x.decomposition_permutations:
+            if len(permutation) == 0:
+                continue
+            score = keep_prob[permutation]
+            mask = score > self.gmm_keep_threshold
+            min_keep = min(int(self.gmm_min_keep), len(score))
+            max_keep = min(int(self.gmm_max_keep), len(score))
+            if mask.sum() < min_keep:
+                ids = torch.topk(score, min_keep, sorted=False).indices
+                mask = torch.zeros_like(mask)
+                mask[ids] = True
+            if max_keep > 0 and mask.sum() > max_keep:
+                kept_scores = score.masked_fill(~mask, -1)
+                ids = torch.topk(kept_scores, max_keep, sorted=False).indices
+                mask = torch.zeros_like(mask)
+                mask[ids] = True
+            if mask.sum() == 0:
+                mask[torch.argmax(score)] = True
+            prune_mask[permutation[mask]] = True
         return prune_mask
 
 
-    def _prune_by_gaussian(self, x, keep_prob):
-        prune_mask = self._make_gaussian_prune_mask(keep_prob, x)
+    def _prune_gmm_inference(self, x, keep_prob):
+        with torch.no_grad():
+            prune_mask = self._make_gmm_prune_mask(x, keep_prob)
         if prune_mask.sum() == 0:
-            return x
+            return None
         return self.pruning(x, prune_mask)
+
+
+    def _make_gaussian_prune_mask(self, keep_prob, x):
+        return self._make_gmm_prune_mask(x, keep_prob.reshape(-1))
+
+
+    def _prune_by_gaussian(self, x, keep_prob):
+        return self._prune_gmm_inference(x, keep_prob.reshape(-1))
 
 
     def forward(self, x, gt_bboxes, gt_labels, img_metas):
@@ -353,66 +616,64 @@ class DSPHead(BaseModule):
                 bboxes_state.append(bbox_state)
         bbox_preds, cls_preds, points = [], [], []
         keep_gts = []
-        gaussian_preds, gaussian_targets, gaussian_regularizers = [], [], []
         keep_preds, prune_masks = [], []
+        gmm_volume_losses, gmm_sparsity_losses = [], []
         prune_mask = None
         inputs = x
         x = inputs[-1]
+        gmm_params = None
         for i in range(len(inputs) - 1, -1, -1):
             if i < len(inputs) - 1:
-                prune_mask = self._get_keep_voxel(x, i + 2, bboxes_state, img_metas)
-                keep_gt = []
-                for permutation in x.decomposition_permutations:
-                    keep_gt.append(prune_mask[permutation])
-                keep_gts.append(keep_gt)
-
-                gaussian_params = None
                 if self.gaussian_pruning_enabled:
-                    gaussian_params = self._predict_gaussian_primitives(x, i)
-
-                x = self.__getattr__(f'up_block_{i + 1}')(x)
-                coords = x.coordinates.float()
-                x_level_features = inputs[i].features_at_coordinates(coords)
-                x_level = ME.SparseTensor(features=x_level_features,
-                                          coordinate_map_key=x.coordinate_map_key,
-                                        coordinate_manager=x.coordinate_manager)
-                x = x + x_level
-
-                if self.gaussian_pruning_enabled:
-                    gaussian_keep_prob, gaussian_regularizer = self._evaluate_gaussian_field(
-                        x, gaussian_params, i + 2)
-                    gaussian_target, _ = self._get_gaussian_targets(
-                        x, i + 2, bboxes_state, img_metas)
-                    gaussian_pred_level = []
-                    gaussian_target_level = []
+                    x = self.__getattr__(f'up_block_{i + 1}')(x)
+                    coords = x.coordinates.float()
+                    x_level_features = inputs[i].features_at_coordinates(coords)
+                    x_level = ME.SparseTensor(features=x_level_features,
+                                              coordinate_map_key=x.coordinate_map_key,
+                                              coordinate_manager=x.coordinate_manager)
+                    x = x + x_level
+                    keep_prob, volume_loss, sparsity_loss = self._evaluate_gmm_field(x, gmm_params)
+                    prune_mask = self._get_keep_voxel(x, i + 2, bboxes_state, img_metas)
+                    keep_gt, keeps = [], []
+                    keep_logit = torch.logit(keep_prob.clamp(1e-4, 1 - 1e-4)).unsqueeze(1)
                     for permutation in x.decomposition_permutations:
-                        gaussian_pred_level.append(gaussian_keep_prob[permutation])
-                        gaussian_target_level.append(gaussian_target[permutation])
-                    gaussian_preds.append(gaussian_pred_level)
-                    gaussian_targets.append(gaussian_target_level)
-                    gaussian_regularizers.append(gaussian_regularizer)
-
-                    if self._gaussian_warmup_active():
-                        x = self._prune_training(x, prune_training_keep)
-                    else:
-                        fused_keep_prob = self._fuse_gaussian_keep_prob(
-                            x, keep_scores, gaussian_keep_prob)
-                        x = self._prune_by_gaussian(x, fused_keep_prob)
+                        keep_gt.append(prune_mask[permutation])
+                        keeps.append(keep_logit[permutation])
+                    keep_gts.append(keep_gt)
+                    keep_preds.append(keeps)
+                    gmm_volume_losses.append(volume_loss)
+                    gmm_sparsity_losses.append(sparsity_loss)
+                    x = self._apply_gmm_training_gate(x, keep_prob)
                 else:
+                    prune_mask = self._get_keep_voxel(x, i + 2, bboxes_state, img_metas)
+                    keep_gt = []
+                    for permutation in out.decomposition_permutations:
+                        keep_gt.append(prune_mask[permutation])
+                    keep_gts.append(keep_gt)
+                    x = self.__getattr__(f'up_block_{i + 1}')(x)
+                    coords = x.coordinates.float()
+                    x_level_features = inputs[i].features_at_coordinates(coords)
+                    x_level = ME.SparseTensor(features=x_level_features,
+                                              coordinate_map_key=x.coordinate_map_key,
+                                              coordinate_manager=x.coordinate_manager)
+                    x = x + x_level
                     x = self._prune_training(x, prune_training_keep)
 
             if i > 0:
-                keep_scores = self.keep_conv[i-1](x)
-                prune_training_keep = ME.SparseTensor(
-                                    -keep_scores.features,
-                                    coordinate_map_key=keep_scores.coordinate_map_key,
-                                    coordinate_manager=keep_scores.coordinate_manager)
-                keep_pred = keep_scores.features
-                prune_inference = keep_pred
-                keeps = []
-                for permutation in x.decomposition_permutations:
-                    keeps.append(keep_pred[permutation])
-                keep_preds.append(keeps)
+                if self.gaussian_pruning_enabled:
+                    gmm_params = self._decode_gmm_params(x, i - 1)
+                else:
+                    keep_scores = self.keep_conv[i-1](x)
+                    prune_training_keep = ME.SparseTensor(
+                                        -keep_scores.features,
+                                        coordinate_map_key=keep_scores.coordinate_map_key,
+                                        coordinate_manager=keep_scores.coordinate_manager)
+                    keep_pred = keep_scores.features
+                    prune_inference = keep_pred
+                    keeps = []
+                    for permutation in x.decomposition_permutations:
+                        keeps.append(keep_pred[permutation])
+                    keep_preds.append(keeps)
             x = self.__getattr__(f'lateral_block_{i}')(x)
             out = self.__getattr__(f'out_block_{i}')(x)
             bbox_pred, cls_pred, point, prune_training = self._forward_single(out)
@@ -420,13 +681,8 @@ class DSPHead(BaseModule):
             cls_preds.append(cls_pred)
             points.append(point)
 
-        if not self.gaussian_pruning_enabled:
-            gaussian_preds = None
-            gaussian_targets = None
-            gaussian_regularizers = None
-        return (bbox_preds[::-1], cls_preds[::-1], points[::-1],
-                keep_preds[::-1], keep_gts[::-1], gaussian_preds, gaussian_targets,
-                gaussian_regularizers, bboxes_level)
+        return (bbox_preds[::-1], cls_preds[::-1], points[::-1], keep_preds[::-1],
+                keep_gts[::-1], bboxes_level, gmm_volume_losses, gmm_sparsity_losses)
 
 
     def _prune_inference(self, x, scores):
@@ -533,7 +789,7 @@ class DSPHead(BaseModule):
                         inside_box_condition = distance.min(dim=-1).values > 0
                         inside_box_condition = inside_box_condition.sum(dim=1)
                         inside_box_condition = inside_box_condition >= 1
-                        inside_box_conditions = inside_box_conditions | inside_box_condition
+                        inside_box_conditions += inside_box_condition
                 mask.append(inside_box_conditions)
             else:
                 inside_box_conditions = torch.zeros((len(permutation)), dtype=torch.bool).to(point.device)
@@ -542,51 +798,6 @@ class DSPHead(BaseModule):
         prune_mask = torch.cat(mask)
         prune_mask = prune_mask.to(input.device)
         return prune_mask
-
-
-    @torch.no_grad()
-    def _get_gaussian_targets(self, input, cur_level, bboxes_state, input_metas):
-        hard_support = self._get_keep_voxel(input, cur_level, bboxes_state, input_metas)
-        targets = input.features.new_zeros((len(input.features),))
-        bboxes = []
-        for _ in range(len(input_metas)):
-            bboxes.append([])
-        for idx in range(len(input_metas)):
-            for n in range(len(bboxes_state[idx])):
-                if bboxes_state[idx][n][0] < (cur_level - 1):
-                    bboxes[idx].append(bboxes_state[idx][n])
-
-        edge_prob = min(max(float(self.gaussian_target_edge_prob), 1e-4), 0.999)
-        edge_prob = input.features.new_tensor(edge_prob)
-        half_window = input.features.new_tensor(self._level_half_window(cur_level))
-        sigma = half_window / torch.sqrt(-2 * torch.log(edge_prob))
-        sigma = torch.clamp(sigma, min=1e-6)
-
-        for idx, permutation in enumerate(input.decomposition_permutations):
-            support = hard_support[permutation]
-            if support.sum() == 0 or len(bboxes[idx]) == 0:
-                continue
-            local_ids = torch.nonzero(support, as_tuple=False).squeeze(1)
-            global_ids = permutation[local_ids]
-            boxes = torch.cat(bboxes[idx]).reshape([-1, 8]).to(input.device)
-            for start in range(0, len(global_ids), self.gaussian_chunk_size):
-                end = min(start + self.gaussian_chunk_size, len(global_ids))
-                ids = global_ids[start:end]
-                point = input.coordinates[ids][:, 1:] * self.voxel_size
-                point_l = point.unsqueeze(1).expand(len(point), len(boxes), 3)
-                boxes_l = boxes.unsqueeze(0).expand(len(point), len(boxes), 8)
-                shift = torch.stack(
-                    (point_l[..., 0] - boxes_l[..., 1],
-                     point_l[..., 1] - boxes_l[..., 2],
-                     point_l[..., 2] - boxes_l[..., 3]),
-                    dim=-1).permute(1, 0, 2)
-                shift = rotation_3d_in_axis(
-                    shift, -boxes[:, 7], axis=2).permute(1, 0, 2)
-                score = torch.exp(-0.5 * (shift ** 2).sum(dim=-1) / (sigma ** 2))
-                targets[ids] = score.max(dim=1).values.clamp(min=0, max=1)
-
-        targets = targets * hard_support.float()
-        return targets, hard_support
 
 
     @staticmethod
@@ -688,68 +899,31 @@ class DSPHead(BaseModule):
                     self._bbox_pred_to_bbox(pos_points, pos_bbox_preds)),
                 self._bbox_to_loss(pos_bbox_targets))
         else:
-            bbox_loss = None
+            bbox_loss = pos_bbox_preds.sum().reshape(1)
         return bbox_loss, cls_loss, pos_mask
 
 
-    def _gaussian_loss(self, gaussian_preds, gaussian_targets, gaussian_regularizers):
-        if gaussian_preds is None or gaussian_targets is None:
-            return None, None
-        prune_losses = []
-        for pred_level, target_level in zip(gaussian_preds, gaussian_targets):
-            for pred, target in zip(pred_level, target_level):
-                if len(pred) == 0:
-                    prune_losses.append(pred.sum() * 0)
-                    continue
-                pred = pred.clamp(min=1e-4, max=1 - 1e-4)
-                target = target.float().clamp(min=0, max=1)
-                bce = F.binary_cross_entropy(pred, target, reduction='none')
-                pos_mask = target > 0
-                if pos_mask.any():
-                    pos_loss = bce[pos_mask].mean()
-                    if (~pos_mask).any():
-                        neg_loss = bce[~pos_mask].mean()
-                    else:
-                        neg_loss = bce.sum() * 0
-                    prune_losses.append(pos_loss + 0.25 * neg_loss)
-                else:
-                    prune_losses.append(bce.mean())
-        if len(prune_losses) == 0:
-            return None, None
-        gaussian_prune_loss = sum(prune_losses) / len(prune_losses)
-        gaussian_prune_loss = self.gaussian_loss_weight * gaussian_prune_loss
-
-        if gaussian_regularizers is not None and len(gaussian_regularizers) > 0:
-            gaussian_primitive_loss = sum(gaussian_regularizers) / len(gaussian_regularizers)
-            gaussian_primitive_loss = self.gaussian_primitive_loss_weight * gaussian_primitive_loss
-        else:
-            gaussian_primitive_loss = gaussian_prune_loss * 0
-        return gaussian_prune_loss, gaussian_primitive_loss
-
-
     def _loss(self, bbox_preds, cls_preds, points,
-              gt_bboxes, gt_labels, img_metas, keep_preds, keep_gts,
-              gaussian_preds, gaussian_targets, gaussian_regularizers, bboxes_level):
+              gt_bboxes, gt_labels, img_metas, keep_preds, keep_gts, bboxes_level,
+              gmm_volume_losses=None, gmm_sparsity_losses=None):
         bbox_losses, cls_losses, pos_masks = [], [], []
+        zero_loss = self.bbox_conv.kernel.sum() * 0
 
-        #keep loss
-        keep_losses = 0
-        for i in range(len(img_metas)):
-            k_loss = 0
-            keep_pred = [x[i] for x in keep_preds]
-            keep_gt = [x[i] for x in keep_gts]
-            for j in range(len(keep_preds)):
-                pred = keep_pred[j]
-                gt = (keep_gt[j]).long()
-
-                if gt.sum() != 0:
-                    keep_loss = self.keep_loss(pred, gt, avg_factor=gt.sum())
-                    k_loss = torch.mean(keep_loss) / 3 + k_loss
-                else:
-                    keep_loss = self.keep_loss(pred, gt, avg_factor=len(gt))
-                    k_loss = torch.mean(keep_loss) / 3 + k_loss
-
-            keep_losses = keep_losses + k_loss
+        keep_losses = zero_loss
+        if len(keep_preds) > 0:
+            for i in range(len(img_metas)):
+                k_loss = zero_loss
+                keep_pred = [x[i] for x in keep_preds]
+                keep_gt = [x[i] for x in keep_gts]
+                for j in range(len(keep_preds)):
+                    pred = keep_pred[j]
+                    gt = keep_gt[j].long()
+                    if gt.numel() == 0:
+                        continue
+                    avg_factor = gt.sum() if gt.sum() != 0 else gt.new_tensor(gt.numel())
+                    keep_loss = self.keep_loss(pred, gt, avg_factor=avg_factor)
+                    k_loss = torch.mean(keep_loss) / len(keep_preds) + k_loss
+                keep_losses = keep_losses + k_loss
 
         for i in range(len(img_metas)):
             bbox_loss, cls_loss, pos_mask = self._loss_single(
@@ -765,34 +939,31 @@ class DSPHead(BaseModule):
             cls_losses.append(cls_loss)
             pos_masks.append(pos_mask)
 
-        if len(bbox_losses) > 0:
-            bbox_loss = torch.mean(torch.cat(bbox_losses))
-        else:
-            bbox_loss = sum(x.sum() for x in cls_losses) * 0
-        pos_count = torch.sum(torch.cat(pos_masks)).clamp(min=1)
-        losses = dict(
+        bbox_loss = torch.mean(torch.cat(bbox_losses)) if len(bbox_losses) > 0 else zero_loss
+        cls_loss = torch.sum(torch.cat(cls_losses)) / torch.sum(torch.cat(pos_masks)).clamp(min=1)
+        loss_dict = dict(
             bbox_loss=bbox_loss,
-            cls_loss=torch.sum(torch.cat(cls_losses)) / pos_count,
-            keep_loss=0.01 * keep_losses / len(img_metas))
+            cls_loss=cls_loss,
+            keep_loss=self.gmm_loss_weight * keep_losses / len(img_metas))
 
         if self.gaussian_pruning_enabled:
-            gaussian_prune_loss, gaussian_primitive_loss = self._gaussian_loss(
-                gaussian_preds, gaussian_targets, gaussian_regularizers)
-            if gaussian_prune_loss is not None:
-                losses['gaussian_prune_loss'] = gaussian_prune_loss
-            if gaussian_primitive_loss is not None:
-                losses['gaussian_primitive_loss'] = gaussian_primitive_loss
-        return losses
+            if gmm_volume_losses:
+                loss_dict['loss_gmm_volume'] = self.gmm_volume_loss_weight * torch.stack(gmm_volume_losses).mean()
+            else:
+                loss_dict['loss_gmm_volume'] = zero_loss
+            if gmm_sparsity_losses:
+                loss_dict['loss_gmm_sparsity'] = self.gmm_sparsity_loss_weight * torch.stack(gmm_sparsity_losses).mean()
+            else:
+                loss_dict['loss_gmm_sparsity'] = zero_loss
+        return loss_dict
 
 
     def forward_train(self, x, gt_bboxes, gt_labels, img_metas):
-        (bbox_preds, cls_preds, points, keep_preds, keep_gts,
-         gaussian_preds, gaussian_targets, gaussian_regularizers,
-         bboxes_level) = self(x, gt_bboxes, gt_labels, img_metas)
+        (bbox_preds, cls_preds, points, keep_preds, keep_gts, bboxes_level,
+         gmm_volume_losses, gmm_sparsity_losses) = self(x, gt_bboxes, gt_labels, img_metas)
         return self._loss(bbox_preds, cls_preds, points,
-                          gt_bboxes, gt_labels, img_metas, keep_preds, keep_gts,
-                          gaussian_preds, gaussian_targets, gaussian_regularizers,
-                          bboxes_level)
+                          gt_bboxes, gt_labels, img_metas, keep_preds, keep_gts, bboxes_level,
+                          gmm_volume_losses, gmm_sparsity_losses)
 
 
     def _nms(self, bboxes, scores, img_meta):
@@ -892,10 +1063,10 @@ class DSPHead(BaseModule):
         x = inputs[-1]
         bbox_preds, cls_preds, points = [], [], []
         keep_scores = None
+        gmm_params = None
         for i in range(len(inputs) - 1, -1, -1):
             if i < len(inputs) - 1:
                 if self.gaussian_pruning_enabled:
-                    gaussian_params = self._predict_gaussian_primitives(x, i)
                     x = self.__getattr__(f'up_block_{i + 1}')(x)
                     coords = x.coordinates.float()
                     x_level_features = inputs[i].features_at_coordinates(coords)
@@ -903,11 +1074,10 @@ class DSPHead(BaseModule):
                                               coordinate_map_key=x.coordinate_map_key,
                                               coordinate_manager=x.coordinate_manager)
                     x = x + x_level
-                    gaussian_keep_prob, _ = self._evaluate_gaussian_field(
-                        x, gaussian_params, i + 2)
-                    fused_keep_prob = self._fuse_gaussian_keep_prob(
-                        x, keep_scores, gaussian_keep_prob)
-                    x = self._prune_by_gaussian(x, fused_keep_prob)
+                    keep_prob, _, _ = self._evaluate_gmm_field(x, gmm_params)
+                    x = self._prune_gmm_inference(x, keep_prob)
+                    if x is None:
+                        break
                 else:
                     x = self._prune_inference(x, prune_inference)
                     if x != None:
@@ -922,9 +1092,12 @@ class DSPHead(BaseModule):
                         break
 
             if i > 0:
-                keep_scores = self.keep_conv[i-1](x)
-                keep_pred = keep_scores.features
-                prune_inference = keep_pred
+                if self.gaussian_pruning_enabled:
+                    gmm_params = self._decode_gmm_params(x, i - 1)
+                else:
+                    keep_scores = self.keep_conv[i-1](x)
+                    keep_pred = keep_scores.features
+                    prune_inference = keep_pred
 
             x = self.__getattr__(f'lateral_block_{i}')(x)
             out = self.__getattr__(f'out_block_{i}')(x)
@@ -944,8 +1117,6 @@ class DSPAssigner:
 
     @torch.no_grad()
     def assign(self, points, gt_bboxes, gt_labels, bboxes_level, img_meta):
-        # -> object id or -1 for each point
-        float_max = points[0].new_tensor(1e8)
         levels = torch.cat([points[i].new_tensor(i, dtype=torch.long).expand(len(points[i]))
                             for i in range(len(points))])
         points = torch.cat(points)
@@ -954,54 +1125,44 @@ class DSPAssigner:
         if len(gt_labels) == 0:
             return gt_labels.new_full((n_points,), -1)
 
-        boxes = torch.cat((gt_bboxes.gravity_center, gt_bboxes.tensor[:, 3:]), dim=1)
-        boxes = boxes.to(points.device).expand(n_points, n_boxes, 7)
-        points = points.unsqueeze(1).expand(n_points, n_boxes, 3)
+        boxes = torch.cat((gt_bboxes.gravity_center, gt_bboxes.tensor[:, 3:]), dim=1).to(points.device)
+        bboxes_level = bboxes_level.squeeze(1).to(points.device)
 
-        # condition 1: fix level for label
-        bboxes_level = bboxes_level.squeeze(1)
-        label_levels = bboxes_level.unsqueeze(0).expand(n_points, n_boxes).to(points.device)
-        point_levels = torch.unsqueeze(levels, 1).expand(n_points, n_boxes)
-        level_condition = label_levels == point_levels
+        nearest_distances = points.new_full((n_points,), 1e8)
+        nearest_ids = torch.full((n_points,), -1, dtype=torch.long, device=points.device)
+        candidate_distances = points.new_full((n_points,), 1e8)
+        candidate_ids = torch.full((n_points,), -1, dtype=torch.long, device=points.device)
 
-        # condition 2: keep topk location per box by center distance
-        center = boxes[..., :3]
-        center_distances = torch.sum(torch.pow(center - points, 2), dim=-1)
-        ######3X3X3 limit
-        L0 = 0.01 * 2**2
+        L0 = 0.01 * 2 ** 2
         p = 7
-        level_box_l = p * (L0 * 2 ** bboxes_level).unsqueeze(0).expand(n_points, n_boxes).unsqueeze(2).to(points.device)
-        level_box = torch.cat((center,level_box_l),dim=2)
-        shift = torch.stack((
-            points[..., 0] - level_box[..., 0],
-            points[..., 1] - level_box[..., 1],
-            points[..., 2] - level_box[..., 2]
-        ), dim=-1)
-        level_centers = level_box[..., :3] + shift
-        dx_min = level_centers[..., 0] - level_box[..., 0] + level_box[..., 3] / 2
-        dx_max = level_box[..., 0] + level_box[..., 3] / 2 - level_centers[..., 0]
-        dy_min = level_centers[..., 1] - level_box[..., 1] + level_box[..., 3] / 2
-        dy_max = level_box[..., 1] + level_box[..., 3] / 2 - level_centers[..., 1]
-        dz_min = level_centers[..., 2] - level_box[..., 2] + level_box[..., 3] / 2
-        dz_max = level_box[..., 2] + level_box[..., 3] / 2 - level_centers[..., 2]
-        level_bbox_targets = torch.stack((dx_min, dx_max, dy_min, dy_max, dz_min, dz_max), dim=-1)
-        inside_level_bbox_mask = level_bbox_targets[..., :6].min(-1)[0] > 0
-        center_distances = torch.where(inside_level_bbox_mask, center_distances, float_max)
-        #######
-        center_distances = torch.where(level_condition, center_distances, float_max)
-        topk_distances = torch.topk(center_distances,
-                                    min(self.top_pts_threshold + 1, len(center_distances)),
-                                    largest=False, dim=0).values[-1]
-        topk_condition = center_distances < topk_distances.unsqueeze(0)
+        topk = min(self.top_pts_threshold + 1, n_points)
+        half_sizes = p * (L0 * 2 ** bboxes_level) / 2
+        box_chunk_size = 16
 
-        # condition 3.0: tonly closest object to poin
-        center_distances = torch.sum(torch.pow(center - points, 2), dim=-1)
-        _, min_inds_ = center_distances.min(dim=1)
+        for start in range(0, n_boxes, box_chunk_size):
+            end = min(start + box_chunk_size, n_boxes)
+            centers = boxes[start:end, :3]
+            offsets = points.unsqueeze(1) - centers.unsqueeze(0)
+            distances = torch.sum(torch.pow(offsets, 2), dim=-1)
 
-        # condition 3: min center distance to box per point
-        center_distances = torch.where(topk_condition, center_distances, float_max)
-        min_values, min_ids = center_distances.min(dim=1)
-        min_inds = torch.where(min_values < float_max, min_ids, -1)
-        min_inds = torch.where(min_inds == min_inds_, min_ids, -1)
+            nearest_values, nearest_local_ids = distances.min(dim=1)
+            update_nearest = nearest_values < nearest_distances
+            nearest_distances[update_nearest] = nearest_values[update_nearest]
+            nearest_ids[update_nearest] = nearest_local_ids[update_nearest] + start
 
-        return min_inds
+            valid_mask = levels.unsqueeze(1) == bboxes_level[start:end].unsqueeze(0)
+            valid_mask = valid_mask & (offsets.abs().max(dim=2).values < half_sizes[start:end].unsqueeze(0))
+            filtered_distances = torch.where(valid_mask, distances, distances.new_full((), 1e8))
+            topk_distances = torch.topk(filtered_distances, topk, largest=False, dim=0).values[-1]
+            topk_mask = filtered_distances < topk_distances.unsqueeze(0)
+            filtered_distances = torch.where(topk_mask, distances, distances.new_full((), 1e8))
+
+            candidate_values, candidate_local_ids = filtered_distances.min(dim=1)
+            update_candidate = candidate_values < candidate_distances
+            candidate_distances[update_candidate] = candidate_values[update_candidate]
+            candidate_ids[update_candidate] = candidate_local_ids[update_candidate] + start
+
+        assigned_ids = torch.full((n_points,), -1, dtype=torch.long, device=points.device)
+        assigned_mask = candidate_ids == nearest_ids
+        assigned_ids[assigned_mask] = candidate_ids[assigned_mask]
+        return assigned_ids

@@ -1,5 +1,5 @@
 voxel_size = .01
-n_points = 100000
+n_points = 30000
 
 model = dict(
     type='DSPDet3D',
@@ -22,7 +22,7 @@ model = dict(
         r=7,
         prune_threshold=0.3,
         gaussian_pruning=dict(
-            enabled=False,
+            enabled=True,
             num_primitives=1,
             projection='nearest',
             keep_threshold=0.5,
@@ -30,13 +30,26 @@ model = dict(
             max_keep=100000,
             warmup_epochs=1,
             loss_weight=0.01,
+            gmm_loss_weight=0.01,
             primitive_loss_weight=0.0,
             sigma_scale=0.5,
             sigma_min=0.1,
             sigma_max=2.0,
+            scale_min=0.1,
+            scale_max=2.0,
             mean_offset_scale=1.5,
             target_edge_prob=0.5,
-            chunk_size=65536,
+            chunk_size=2048,
+            knn_k=1,
+            neighbor_backend='local_window',
+            local_window_radius=1,
+            local_cell_size_scale=1.0,
+            local_dense_max_cells=2000000,
+            local_fallback='none',
+            local_fallback_radius=1,
+            train_gate_floor=0.05,
+            volume_loss_weight=0.005,
+            opacity_sparsity_loss_weight=0.01,
             fusion_weight=0.2),
         bbox_loss=dict(type='AxisAlignedIoULoss2', mode='diou', reduction='none')),
     train_cfg=dict(),
@@ -53,21 +66,21 @@ custom_hooks = [
 
 checkpoint_config = dict(interval=1, max_keep_ckpts=12)
 log_config = dict(
-    interval=50,
+    interval=1,
     hooks=[
         dict(type='TextLoggerHook'),
         # dict(type='TensorboardLoggerHook')
 ])
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
-work_dir = None
+work_dir = 'work_dirs/scannet_md40_3dgmm_1gpu_bs2'
 load_from = None
 resume_from = None
 workflow = [('train', 1)]
 
-n_points = 100000
+n_points = 30000
 dataset_type = 'ScanNetDataset'
-data_root = '/path/to/.pkl/'
+data_root = 'data/ScanNet-md40/mmdet_scannet/'
 class_names = ('bathtub', 'bed', 'bench', 'bookshelf', 'bottle', 'chair', 'cup', 'curtain', 'desk', 'door', 'dresser',
                  'keyboard', 'lamp', 'laptop', 'monitor', 'night_stand', 'plant', 'sofa', 'stool', 'table', 'toilet',
                  'wardrobe')
@@ -127,8 +140,8 @@ test_pipeline = [
         ])
 ]
 data = dict(
-    samples_per_gpu=4,
-    workers_per_gpu=4,
+    samples_per_gpu=2,
+    workers_per_gpu=2,
     train=dict(
         type='RepeatDataset',
         times=10,
