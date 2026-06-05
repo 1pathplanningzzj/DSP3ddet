@@ -77,11 +77,35 @@ class DSPHead(BaseModule):
         self.gmm_local_fallback = gaussian_pruning.get('local_fallback', 'none')
         self.gmm_local_fallback_radius = gaussian_pruning.get('local_fallback_radius', self.gmm_local_window_radius)
         self.gmm_train_gate_floor = gaussian_pruning.get('train_gate_floor', 0.05)
+        self.gmm_test_prune_mode = gaussian_pruning.get('test_prune_mode', 'hard')
         self.gmm_scale_min = gaussian_pruning.get('scale_min', gaussian_pruning.get('sigma_min', 0.1))
         self.gmm_scale_max = gaussian_pruning.get('scale_max', gaussian_pruning.get('sigma_max', 2.0))
         self.gmm_volume_loss_weight = gaussian_pruning.get('volume_loss_weight', 0.005)
         self.gmm_sparsity_loss_weight = gaussian_pruning.get('opacity_sparsity_loss_weight', 0.01)
         self.gmm_loss_weight = gaussian_pruning.get('gmm_loss_weight', gaussian_pruning.get('loss_weight', 0.01))
+        self.gmm_train_prune_mode = gaussian_pruning.get('train_prune_mode', 'soft')
+        self.gmm_hard_prune_start_epoch = gaussian_pruning.get(
+            'hard_prune_start_epoch', self.gmm_warmup_epochs)
+        self.gmm_target_type = gaussian_pruning.get('target_type', 'hard')
+        if self.gmm_target_type == 'soft_support':
+            self.gmm_target_type = 'soft_occ'
+        self.gmm_soft_target_scale = gaussian_pruning.get(
+            'soft_target_scale', gaussian_pruning.get('soft_occ_scale', 1.0))
+        self.gmm_soft_target_norm_mode = gaussian_pruning.get('soft_target_norm_mode', 'fixed')
+        self.gmm_soft_target_box_scale = gaussian_pruning.get('soft_target_box_scale', 0.5)
+        self.gmm_soft_target_min_scale = gaussian_pruning.get('soft_target_min_scale', 0.5)
+        self.gmm_soft_pos_weight = gaussian_pruning.get('soft_pos_weight', 1.0)
+        self.gmm_budget_loss_weight = gaussian_pruning.get('budget_loss_weight', 0.0)
+        if self.gmm_train_prune_mode not in ('soft', 'hard', 'soft_then_hard'):
+            raise ValueError(
+                f'Unsupported GMM train prune mode: {self.gmm_train_prune_mode}')
+        if self.gmm_target_type not in ('hard', 'soft_occ'):
+            raise ValueError(f'Unsupported GMM target type: {self.gmm_target_type}')
+        if self.gmm_test_prune_mode not in ('hard', 'soft', 'match_train'):
+            raise ValueError(f'Unsupported GMM test prune mode: {self.gmm_test_prune_mode}')
+        if self.gmm_soft_target_norm_mode not in ('fixed', 'box_adaptive'):
+            raise ValueError(
+                f'Unsupported GMM soft target norm mode: {self.gmm_soft_target_norm_mode}')
 
 
     def _freeze_inactive_pruning_heads(self):
@@ -545,6 +569,36 @@ class DSPHead(BaseModule):
         return self._sparse_like(x, x.features * gate.unsqueeze(1))
 
 
+    def _use_hard_training_prune(self):
+        if self.gmm_train_prune_mode == 'hard':
+            return True
+        if self.gmm_train_prune_mode == 'soft':
+            return False
+        return self.current_epoch >= self.gmm_hard_prune_start_epoch
+
+
+    def _use_hard_test_prune(self):
+        if self.gmm_test_prune_mode == 'hard':
+            return True
+        if self.gmm_test_prune_mode == 'soft':
+            return False
+        return self._use_hard_training_prune()
+
+
+    def _apply_gmm_training_pruning(self, x, keep_prob):
+        if not self._use_hard_training_prune():
+            return self._apply_gmm_training_gate(x, keep_prob)
+
+        if self.current_epoch < self.gmm_warmup_epochs:
+            return x
+
+        with torch.no_grad():
+            prune_mask = self._make_gmm_prune_mask(x, keep_prob)
+        if prune_mask.sum() == 0:
+            return None
+        return self.pruning(x, prune_mask)
+
+
     def _make_gmm_prune_mask(self, x, keep_prob):
         prune_mask = keep_prob.new_zeros((len(keep_prob),), dtype=torch.bool)
         for permutation in x.decomposition_permutations:
@@ -575,6 +629,12 @@ class DSPHead(BaseModule):
         if prune_mask.sum() == 0:
             return None
         return self.pruning(x, prune_mask)
+
+
+    def _apply_gmm_test_pruning(self, x, keep_prob):
+        if self._use_hard_test_prune():
+            return self._prune_gmm_inference(x, keep_prob)
+        return self._apply_gmm_training_gate(x, keep_prob)
 
 
     def _make_gaussian_prune_mask(self, keep_prob, x):
@@ -616,6 +676,7 @@ class DSPHead(BaseModule):
                 bboxes_state.append(bbox_state)
         bbox_preds, cls_preds, points = [], [], []
         keep_gts = []
+        keep_hard_gts = []
         keep_preds, prune_masks = [], []
         gmm_volume_losses, gmm_sparsity_losses = [], []
         prune_mask = None
@@ -633,23 +694,39 @@ class DSPHead(BaseModule):
                                               coordinate_manager=x.coordinate_manager)
                     x = x + x_level
                     keep_prob, volume_loss, sparsity_loss = self._evaluate_gmm_field(x, gmm_params)
-                    prune_mask = self._get_keep_voxel(x, i + 2, bboxes_state, img_metas)
-                    keep_gt, keeps = [], []
-                    keep_logit = torch.logit(keep_prob.clamp(1e-4, 1 - 1e-4)).unsqueeze(1)
+                    if self.gmm_target_type == 'soft_occ':
+                        prune_mask, soft_target = self._get_keep_voxel(
+                            x, i + 2, bboxes_state, img_metas, return_soft=True)
+                    else:
+                        prune_mask = self._get_keep_voxel(x, i + 2, bboxes_state, img_metas)
+                        soft_target = None
+                    keep_gt, keep_hard_gt, keeps = [], [], []
+                    if soft_target is not None:
+                        keep_score = keep_prob.unsqueeze(1)
+                    else:
+                        keep_score = torch.logit(keep_prob.clamp(1e-4, 1 - 1e-4)).unsqueeze(1)
                     for permutation in x.decomposition_permutations:
-                        keep_gt.append(prune_mask[permutation])
-                        keeps.append(keep_logit[permutation])
+                        if soft_target is not None:
+                            keep_gt.append(soft_target[permutation])
+                        else:
+                            keep_gt.append(prune_mask[permutation])
+                        keep_hard_gt.append(prune_mask[permutation])
+                        keeps.append(keep_score[permutation])
                     keep_gts.append(keep_gt)
+                    keep_hard_gts.append(keep_hard_gt)
                     keep_preds.append(keeps)
                     gmm_volume_losses.append(volume_loss)
                     gmm_sparsity_losses.append(sparsity_loss)
-                    x = self._apply_gmm_training_gate(x, keep_prob)
+                    x = self._apply_gmm_training_pruning(x, keep_prob)
+                    if x is None:
+                        break
                 else:
                     prune_mask = self._get_keep_voxel(x, i + 2, bboxes_state, img_metas)
                     keep_gt = []
                     for permutation in out.decomposition_permutations:
                         keep_gt.append(prune_mask[permutation])
                     keep_gts.append(keep_gt)
+                    keep_hard_gts.append(keep_gt)
                     x = self.__getattr__(f'up_block_{i + 1}')(x)
                     coords = x.coordinates.float()
                     x_level_features = inputs[i].features_at_coordinates(coords)
@@ -682,7 +759,8 @@ class DSPHead(BaseModule):
             points.append(point)
 
         return (bbox_preds[::-1], cls_preds[::-1], points[::-1], keep_preds[::-1],
-                keep_gts[::-1], bboxes_level, gmm_volume_losses, gmm_sparsity_losses)
+                keep_gts[::-1], keep_hard_gts[::-1], bboxes_level,
+                gmm_volume_losses, gmm_sparsity_losses)
 
 
     def _prune_inference(self, x, scores):
@@ -741,7 +819,7 @@ class DSPHead(BaseModule):
 
 
     @torch.no_grad()
-    def _get_keep_voxel(self, input, cur_level, bboxes_state, input_metas):
+    def _get_keep_voxel(self, input, cur_level, bboxes_state, input_metas, return_soft=False):
         bboxes = []
         for size in range(len(input_metas)):
             bboxes.append([])
@@ -750,7 +828,7 @@ class DSPHead(BaseModule):
                 if bboxes_state[idx][n][0] < (cur_level - 1):
                     bboxes[idx].append(bboxes_state[idx][n])
         idx = 0
-        mask = []
+        mask, soft_targets = [], []
         l0 = self.voxel_size * 2 ** 2  # pool  True :2**3  False:2**2
         for idx, permutation in enumerate(input.decomposition_permutations):
             point = input.coordinates[permutation][:, 1:] * self.voxel_size
@@ -764,6 +842,10 @@ class DSPHead(BaseModule):
                         if boxes[n][0] == l:
                             bboxes_level[l].append(boxes[n])
                 inside_box_conditions = torch.zeros((len(permutation)), dtype=torch.bool).to(point.device)
+                soft_target = point.new_zeros((len(permutation),))
+                level_stride = l0 * 2 ** (cur_level - 1)
+                base_norm = self.gmm_soft_target_scale * self.r * level_stride / 2
+                min_norm = max(float(self.gmm_soft_target_min_scale * level_stride), 1e-6)
                 for l in range(level):
                     if len(bboxes_level[l]) != 0:
                         point_l = point.unsqueeze(1).expand(len(point), len(bboxes_level[l]), 3)
@@ -784,20 +866,39 @@ class DSPHead(BaseModule):
                         dz_min = centers[..., 2] - boxes_l[..., 3] + (up_level_l * l0 * 2 ** (cur_level - 1)) / 2
                         dz_max = boxes_l[..., 3] - centers[..., 2] + (up_level_l * l0 * 2 ** (cur_level - 1)) / 2
 
-
                         distance = torch.stack((dx_min, dx_max, dy_min, dy_max, dz_min, dz_max), dim=-1)
-                        inside_box_condition = distance.min(dim=-1).values > 0
+                        margin = distance.min(dim=-1).values
+                        inside_box_condition = margin > 0
                         inside_box_condition = inside_box_condition.sum(dim=1)
                         inside_box_condition = inside_box_condition >= 1
                         inside_box_conditions += inside_box_condition
+                        if return_soft:
+                            if self.gmm_soft_target_norm_mode == 'box_adaptive':
+                                box_min_edge = boxes_l[..., 4:7].amin(dim=-1)
+                                adaptive_norm = torch.clamp(
+                                    box_min_edge * self.gmm_soft_target_box_scale,
+                                    min=min_norm,
+                                    max=max(float(base_norm), min_norm))
+                            else:
+                                adaptive_norm = margin.new_full(margin.shape, max(float(base_norm), min_norm))
+                            # Small boxes need a sharper target; otherwise their interior voxels stay ambiguous.
+                            occ_box = torch.sigmoid(margin / adaptive_norm)
+                            soft_target = torch.maximum(soft_target, occ_box.max(dim=1).values)
                 mask.append(inside_box_conditions)
+                if return_soft:
+                    soft_targets.append(soft_target)
             else:
                 inside_box_conditions = torch.zeros((len(permutation)), dtype=torch.bool).to(point.device)
                 mask.append(inside_box_conditions)
+                if return_soft:
+                    soft_targets.append(point.new_zeros((len(permutation),)))
 
         prune_mask = torch.cat(mask)
         prune_mask = prune_mask.to(input.device)
-        return prune_mask
+        if not return_soft:
+            return prune_mask
+        soft_target = torch.cat(soft_targets).to(input.device)
+        return prune_mask, soft_target
 
 
     @staticmethod
@@ -904,26 +1005,47 @@ class DSPHead(BaseModule):
 
 
     def _loss(self, bbox_preds, cls_preds, points,
-              gt_bboxes, gt_labels, img_metas, keep_preds, keep_gts, bboxes_level,
+              gt_bboxes, gt_labels, img_metas, keep_preds, keep_gts, keep_hard_gts, bboxes_level,
               gmm_volume_losses=None, gmm_sparsity_losses=None):
         bbox_losses, cls_losses, pos_masks = [], [], []
         zero_loss = self.bbox_conv.kernel.sum() * 0
 
         keep_losses = zero_loss
+        budget_losses = zero_loss
         if len(keep_preds) > 0:
             for i in range(len(img_metas)):
                 k_loss = zero_loss
+                budget_loss = zero_loss
                 keep_pred = [x[i] for x in keep_preds]
                 keep_gt = [x[i] for x in keep_gts]
+                keep_hard_gt = [x[i] for x in keep_hard_gts]
                 for j in range(len(keep_preds)):
                     pred = keep_pred[j]
-                    gt = keep_gt[j].long()
+                    gt = keep_gt[j]
                     if gt.numel() == 0:
                         continue
-                    avg_factor = gt.sum() if gt.sum() != 0 else gt.new_tensor(gt.numel())
-                    keep_loss = self.keep_loss(pred, gt, avg_factor=avg_factor)
-                    k_loss = torch.mean(keep_loss) / len(keep_preds) + k_loss
+                    if self.gaussian_pruning_enabled and self.gmm_target_type == 'soft_occ':
+                        pred = pred.squeeze(1).clamp(1e-4, 1 - 1e-4)
+                        gt = gt.float()
+                        loss_weight = torch.ones_like(gt)
+                        if self.gmm_soft_pos_weight != 1.0:
+                            loss_weight = torch.where(
+                                keep_hard_gt[j].bool(),
+                                loss_weight.new_full(loss_weight.shape, self.gmm_soft_pos_weight),
+                                loss_weight)
+                        keep_loss = F.binary_cross_entropy(pred, gt, reduction='none') * loss_weight
+                        avg_factor = loss_weight.sum().clamp(min=1)
+                        k_loss = keep_loss.sum() / avg_factor / len(keep_preds) + k_loss
+                        if self.gmm_budget_loss_weight > 0:
+                            budget_loss = F.smooth_l1_loss(
+                                pred.mean(), gt.mean(), reduction='mean') / len(keep_preds) + budget_loss
+                    else:
+                        gt = gt.long()
+                        avg_factor = gt.sum() if gt.sum() != 0 else gt.new_tensor(gt.numel())
+                        keep_loss = self.keep_loss(pred, gt, avg_factor=avg_factor)
+                        k_loss = torch.mean(keep_loss) / len(keep_preds) + k_loss
                 keep_losses = keep_losses + k_loss
+                budget_losses = budget_losses + budget_loss
 
         for i in range(len(img_metas)):
             bbox_loss, cls_loss, pos_mask = self._loss_single(
@@ -947,6 +1069,8 @@ class DSPHead(BaseModule):
             keep_loss=self.gmm_loss_weight * keep_losses / len(img_metas))
 
         if self.gaussian_pruning_enabled:
+            if self.gmm_target_type == 'soft_occ' and self.gmm_budget_loss_weight > 0:
+                loss_dict['loss_gmm_budget'] = self.gmm_budget_loss_weight * budget_losses / len(img_metas)
             if gmm_volume_losses:
                 loss_dict['loss_gmm_volume'] = self.gmm_volume_loss_weight * torch.stack(gmm_volume_losses).mean()
             else:
@@ -959,10 +1083,11 @@ class DSPHead(BaseModule):
 
 
     def forward_train(self, x, gt_bboxes, gt_labels, img_metas):
-        (bbox_preds, cls_preds, points, keep_preds, keep_gts, bboxes_level,
+        (bbox_preds, cls_preds, points, keep_preds, keep_gts, keep_hard_gts, bboxes_level,
          gmm_volume_losses, gmm_sparsity_losses) = self(x, gt_bboxes, gt_labels, img_metas)
         return self._loss(bbox_preds, cls_preds, points,
-                          gt_bboxes, gt_labels, img_metas, keep_preds, keep_gts, bboxes_level,
+                          gt_bboxes, gt_labels, img_metas, keep_preds, keep_gts, keep_hard_gts,
+                          bboxes_level,
                           gmm_volume_losses, gmm_sparsity_losses)
 
 
@@ -1075,7 +1200,7 @@ class DSPHead(BaseModule):
                                               coordinate_manager=x.coordinate_manager)
                     x = x + x_level
                     keep_prob, _, _ = self._evaluate_gmm_field(x, gmm_params)
-                    x = self._prune_gmm_inference(x, keep_prob)
+                    x = self._apply_gmm_test_pruning(x, keep_prob)
                     if x is None:
                         break
                 else:

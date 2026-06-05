@@ -518,6 +518,39 @@ CUDA_VISIBLE_DEVICES=0 bash tools/dist_test.sh \
 2. 复制 config，改 `prune_threshold=0.2`，用官方 checkpoint 直接测。
 3. 改 `prune_threshold=0.4`，直接测。
 4. 改 `prune_threshold=0.5`，直接测。
+
+## 8. 当前成功启动的 2 卡 soft-support 训练命令
+
+当前这次成功启动的是直接用 `torch.distributed.launch` 拉起的 2 卡训练，使用 `GPU 0,1`，日志间隔已经改成 `50`。
+
+```bash
+cd /home/czy22/zzj/DSPDet3D
+
+export CUDA_VISIBLE_DEVICES=0,1
+export OMP_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+export PYTHONPATH=/home/czy22/zzj/DSPDet3D:$PYTHONPATH
+export PORT=29511
+
+/data/czy22/anaconda3/envs/dspdet3d/bin/python -m torch.distributed.launch \
+  --nnodes=1 \
+  --node_rank=0 \
+  --master_addr=127.0.0.1 \
+  --nproc_per_node=2 \
+  --master_port=29511 \
+  /home/czy22/zzj/DSPDet3D/tools/train.py \
+  /home/czy22/zzj/DSPDet3D/configs/dspdet3d/dspdet3d_scannet-3d-22class.py \
+  --seed 0 \
+  --launcher pytorch \
+  --work-dir /home/czy22/zzj/DSPDet3D/work_dirs/scannet_md40_3dgmm_softsupport_full_gpu01 \
+  --no-validate
+```
+
+查看日志：
+
+```bash
+tail -f /home/czy22/zzj/DSPDet3D/work_dirs/scannet_md40_3dgmm_softsupport_full_gpu01/*.log
+```
 5. 选择速度/精度更合适的阈值后，再考虑微调训练。
 
 只改 `prune_threshold` 通常不需要重新训练，可以直接用同一个 checkpoint 测试不同速度/精度权衡。
