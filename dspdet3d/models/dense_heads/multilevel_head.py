@@ -86,6 +86,9 @@ class DSPHead(BaseModule):
         self.gmm_train_prune_mode = gaussian_pruning.get('train_prune_mode', 'soft')
         self.gmm_hard_prune_start_epoch = gaussian_pruning.get(
             'hard_prune_start_epoch', self.gmm_warmup_epochs)
+        if self.gmm_train_prune_mode == 'soft_then_hard':
+            # Keep legacy experiment configs runnable, but disable epoch-based hard switching.
+            self.gmm_train_prune_mode = 'soft'
         self.gmm_target_type = gaussian_pruning.get('target_type', 'hard')
         if self.gmm_target_type == 'soft_support':
             self.gmm_target_type = 'soft_occ'
@@ -96,7 +99,13 @@ class DSPHead(BaseModule):
         self.gmm_soft_target_min_scale = gaussian_pruning.get('soft_target_min_scale', 0.5)
         self.gmm_soft_pos_weight = gaussian_pruning.get('soft_pos_weight', 1.0)
         self.gmm_budget_loss_weight = gaussian_pruning.get('budget_loss_weight', 0.0)
-        if self.gmm_train_prune_mode not in ('soft', 'hard', 'soft_then_hard'):
+        self.gmm_score_fusion_mode = gaussian_pruning.get('score_fusion_mode', 'none')
+        self.gmm_score_fusion_weight = gaussian_pruning.get(
+            'score_fusion_weight', gaussian_pruning.get('fusion_weight', 0.0))
+        self.gmm_score_fusion_floor = gaussian_pruning.get('score_fusion_floor', 0.5)
+        self.gmm_score_fusion_logit_weight = gaussian_pruning.get(
+            'score_fusion_logit_weight', self.gmm_score_fusion_weight)
+        if self.gmm_train_prune_mode not in ('soft', 'hard'):
             raise ValueError(
                 f'Unsupported GMM train prune mode: {self.gmm_train_prune_mode}')
         if self.gmm_target_type not in ('hard', 'soft_occ'):
@@ -106,6 +115,9 @@ class DSPHead(BaseModule):
         if self.gmm_soft_target_norm_mode not in ('fixed', 'box_adaptive'):
             raise ValueError(
                 f'Unsupported GMM soft target norm mode: {self.gmm_soft_target_norm_mode}')
+        if self.gmm_score_fusion_mode not in ('none', 'mul', 'logit'):
+            raise ValueError(
+                f'Unsupported GMM score fusion mode: {self.gmm_score_fusion_mode}')
 
 
     def _freeze_inactive_pruning_heads(self):
@@ -570,11 +582,7 @@ class DSPHead(BaseModule):
 
 
     def _use_hard_training_prune(self):
-        if self.gmm_train_prune_mode == 'hard':
-            return True
-        if self.gmm_train_prune_mode == 'soft':
-            return False
-        return self.current_epoch >= self.gmm_hard_prune_start_epoch
+        return self.gmm_train_prune_mode == 'hard'
 
 
     def _use_hard_test_prune(self):
@@ -635,6 +643,26 @@ class DSPHead(BaseModule):
         if self._use_hard_test_prune():
             return self._prune_gmm_inference(x, keep_prob)
         return self._apply_gmm_training_gate(x, keep_prob)
+
+
+    def _split_by_permutation(self, values, x):
+        return [values[permutation] for permutation in x.decomposition_permutations]
+
+
+    def _fuse_gmm_scores(self, scores, keep_probs):
+        if keep_probs is None or self.gmm_score_fusion_mode == 'none':
+            return scores
+
+        keep_probs = keep_probs.to(scores.dtype)
+        if self.gmm_score_fusion_mode == 'mul':
+            keep_probs = keep_probs.clamp(self.gmm_score_fusion_floor, 1.0)
+            gate = (1 - self.gmm_score_fusion_weight) + self.gmm_score_fusion_weight * keep_probs
+            return scores * gate.unsqueeze(1)
+
+        scores = scores.clamp(1e-4, 1 - 1e-4)
+        keep_logits = torch.logit(keep_probs.clamp(1e-4, 1 - 1e-4))
+        return torch.sigmoid(scores.logit() +
+                             self.gmm_score_fusion_logit_weight * keep_logits.unsqueeze(1))
 
 
     def _make_gaussian_prune_mask(self, keep_prob, x):
@@ -1154,8 +1182,10 @@ class DSPHead(BaseModule):
         return nms_bboxes, nms_scores, nms_labels
 
 
-    def _get_bboxes_single(self, bbox_preds, cls_preds, points, img_meta):
+    def _get_bboxes_single(self, bbox_preds, cls_preds, points, img_meta, keep_probs=None):
         scores = torch.cat(cls_preds).sigmoid()
+        if keep_probs is not None:
+            scores = self._fuse_gmm_scores(scores, torch.cat(keep_probs))
         bbox_preds = torch.cat(bbox_preds)
         points = torch.cat(points)
         max_scores, _ = scores.max(dim=1)
@@ -1171,14 +1201,15 @@ class DSPHead(BaseModule):
         return boxes, scores, labels
 
 
-    def _get_bboxes(self, bbox_preds, cls_preds, points, img_metas):
+    def _get_bboxes(self, bbox_preds, cls_preds, points, img_metas, keep_probs=None):
         results = []
         for i in range(len(img_metas)):
             result = self._get_bboxes_single(
                 bbox_preds=[x[i] for x in bbox_preds],
                 cls_preds=[x[i] for x in cls_preds],
                 points=[x[i] for x in points],
-                img_meta=img_metas[i])
+                img_meta=img_metas[i],
+                keep_probs=None if keep_probs is None else [x[i] for x in keep_probs])
             results.append(result)
         return results
 
@@ -1187,9 +1218,11 @@ class DSPHead(BaseModule):
         inputs = x
         x = inputs[-1]
         bbox_preds, cls_preds, points = [], [], []
+        keep_probs = [] if self.gaussian_pruning_enabled else None
         keep_scores = None
         gmm_params = None
         for i in range(len(inputs) - 1, -1, -1):
+            current_keep_prob = None
             if i < len(inputs) - 1:
                 if self.gaussian_pruning_enabled:
                     x = self.__getattr__(f'up_block_{i + 1}')(x)
@@ -1200,6 +1233,7 @@ class DSPHead(BaseModule):
                                               coordinate_manager=x.coordinate_manager)
                     x = x + x_level
                     keep_prob, _, _ = self._evaluate_gmm_field(x, gmm_params)
+                    current_keep_prob = keep_prob
                     x = self._apply_gmm_test_pruning(x, keep_prob)
                     if x is None:
                         break
@@ -1230,8 +1264,14 @@ class DSPHead(BaseModule):
             bbox_preds.append(bbox_pred)
             cls_preds.append(cls_pred)
             points.append(point)
+            if keep_probs is not None:
+                if current_keep_prob is None:
+                    current_keep_prob = out.features.new_ones((len(out.features),))
+                keep_probs.append(self._split_by_permutation(current_keep_prob, out))
 
-        return self._get_bboxes(bbox_preds[::-1], cls_preds[::-1], points[::-1], img_metas)
+        keep_probs = keep_probs[::-1] if keep_probs is not None else None
+        return self._get_bboxes(
+            bbox_preds[::-1], cls_preds[::-1], points[::-1], img_metas, keep_probs=keep_probs)
 
 
 @BBOX_ASSIGNERS.register_module()
