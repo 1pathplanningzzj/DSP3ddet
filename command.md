@@ -837,3 +837,48 @@ CUDA_VISIBLE_DEVICES=0 bash tools/dist_train.sh \
 tail -f work_dirs/scannet_md40_3dgmm_1gpu_bs4/nohup_train.log
 nvidia-smi
 ```
+
+---
+
+2026-06-08 新增：ScanNet GMM 纯 soft 训练，单卡 `GPU 0`，用 `tmux` 挂起。
+
+配置文件：
+
+```bash
+configs/dspdet3d/dspdet3d_scannet-3d-22class_gmm_soft.py
+```
+
+核心设置：
+
+```python
+gaussian_pruning.train_prune_mode = 'soft'
+gaussian_pruning.test_prune_mode = 'soft'
+```
+
+启动命令：
+
+```bash
+cd /home/czy22/zzj/DSPDet3D
+
+mkdir -p work_dirs/scannet_md40_3dgmm_soft_train_soft_test_gpu0
+
+tmux new-session -d -s scannet_gmm_soft_gpu0 "bash -lc '
+cd /home/czy22/zzj/DSPDet3D
+export PYTHONPATH=/home/czy22/zzj/DSPDet3D:$PYTHONPATH
+export LD_LIBRARY_PATH=/data/czy22/anaconda3/envs/dspdet3d/lib:$LD_LIBRARY_PATH
+CUDA_VISIBLE_DEVICES=0 /data/czy22/anaconda3/envs/dspdet3d/bin/python \
+  tools/train.py \
+  configs/dspdet3d/dspdet3d_scannet-3d-22class_gmm_soft.py \
+  --work-dir work_dirs/scannet_md40_3dgmm_soft_train_soft_test_gpu0 \
+  > work_dirs/scannet_md40_3dgmm_soft_train_soft_test_gpu0/tmux_train.log 2>&1
+'"
+```
+
+查看训练状态：
+
+```bash
+tail -f work_dirs/scannet_md40_3dgmm_soft_train_soft_test_gpu0/tmux_train.log
+tail -f work_dirs/scannet_md40_3dgmm_soft_train_soft_test_gpu0/20260608_221930.log
+tmux ls
+nvidia-smi
+```

@@ -99,6 +99,10 @@ class DSPHead(BaseModule):
         self.gmm_soft_target_min_scale = gaussian_pruning.get('soft_target_min_scale', 0.5)
         self.gmm_soft_pos_weight = gaussian_pruning.get('soft_pos_weight', 1.0)
         self.gmm_budget_loss_weight = gaussian_pruning.get('budget_loss_weight', 0.0)
+        self.gmm_target_keep_ratios = gaussian_pruning.get('target_keep_ratios')
+        self.gmm_offset_range = gaussian_pruning.get('offset_range', 0.0)
+        self.gmm_offset_loss_weight = gaussian_pruning.get('offset_loss_weight', 0.0)
+        self.gmm_aggregation = gaussian_pruning.get('aggregation', 'max')
         self.gmm_score_fusion_mode = gaussian_pruning.get('score_fusion_mode', 'none')
         self.gmm_score_fusion_weight = gaussian_pruning.get(
             'score_fusion_weight', gaussian_pruning.get('fusion_weight', 0.0))
@@ -112,6 +116,8 @@ class DSPHead(BaseModule):
             raise ValueError(f'Unsupported GMM target type: {self.gmm_target_type}')
         if self.gmm_test_prune_mode not in ('hard', 'soft', 'match_train'):
             raise ValueError(f'Unsupported GMM test prune mode: {self.gmm_test_prune_mode}')
+        if self.gmm_aggregation not in ('max', 'noisy_or', 'topk_mean'):
+            raise ValueError(f'Unsupported GMM aggregation mode: {self.gmm_aggregation}')
         if self.gmm_soft_target_norm_mode not in ('fixed', 'box_adaptive'):
             raise ValueError(
                 f'Unsupported GMM soft target norm mode: {self.gmm_soft_target_norm_mode}')
@@ -122,7 +128,7 @@ class DSPHead(BaseModule):
 
     def _freeze_inactive_pruning_heads(self):
         inactive_heads = [self.keep_conv] if self.gaussian_pruning_enabled else [
-            self.opacity_conv, self.scale_conv, self.rot_conv]
+            self.opacity_conv, self.scale_conv, self.offset_conv, self.rot_conv]
         for heads in inactive_heads:
             for parameter in heads.parameters():
                 parameter.requires_grad = False
@@ -180,11 +186,21 @@ class DSPHead(BaseModule):
                 in_channels[i + 1], self.gmm_num_primitives * 3, kernel_size=1, bias=True, dimension=3)
             for i in range(len(in_channels) - 1)
         ])
+        self.offset_conv = nn.ModuleList([
+            ME.MinkowskiConvolution(
+                in_channels[i + 1], self.gmm_num_primitives * 3, kernel_size=1, bias=True, dimension=3)
+            for i in range(len(in_channels) - 1)
+        ])
         self.rot_conv = nn.ModuleList([
             ME.MinkowskiConvolution(
                 in_channels[i + 1], self.gmm_num_primitives * 4, kernel_size=1, bias=True, dimension=3)
             for i in range(len(in_channels) - 1)
         ])
+        if self.gmm_target_keep_ratios is not None and \
+                len(self.gmm_target_keep_ratios) != len(self.keep_conv):
+            raise ValueError(
+                'target_keep_ratios must match the number of pruning transitions: '
+                f'got {len(self.gmm_target_keep_ratios)} ratios for {len(self.keep_conv)} levels')
         self.pruning = ME.MinkowskiPruning()
 
         for i in range(len(in_channels)):
@@ -216,6 +232,8 @@ class DSPHead(BaseModule):
             nn.init.constant_(self.opacity_conv[i].bias, bias_init_with_prob(.8))
             nn.init.normal_(self.scale_conv[i].kernel, std=.01)
             nn.init.constant_(self.scale_conv[i].bias, 0)
+            nn.init.normal_(self.offset_conv[i].kernel, std=.01)
+            nn.init.constant_(self.offset_conv[i].bias, 0)
             nn.init.normal_(self.rot_conv[i].kernel, std=.01)
             nn.init.constant_(self.rot_conv[i].bias, 0)
             with torch.no_grad():
@@ -224,7 +242,8 @@ class DSPHead(BaseModule):
         for n, m in self.named_modules():
             if ('bbox_conv' not in n) and ('cls_conv' not in n) \
                 and ('keep_conv' not in n) and ('opacity_conv' not in n) \
-                and ('scale_conv' not in n) and ('rot_conv' not in n) \
+                and ('scale_conv' not in n) and ('offset_conv' not in n) \
+                and ('rot_conv' not in n) \
                 and ('loss' not in n):
                 if isinstance(m, ME.MinkowskiConvolution):
                     ME.utils.kaiming_normal_(
@@ -297,41 +316,77 @@ class DSPHead(BaseModule):
 
     def _decode_gmm_params(self, x, transition_idx):
         n_primitives = self.gmm_num_primitives
+        spacing = self._gmm_level_spacing(transition_idx)
+        base_coords = x.coordinates[:, 1:].float() * self.voxel_size
         opacity = torch.sigmoid(self.opacity_conv[transition_idx](x).features)
         scale_logits = self.scale_conv[transition_idx](x).features.reshape(-1, n_primitives, 3)
+        offset_logits = self.offset_conv[transition_idx](x).features.reshape(-1, n_primitives, 3)
         rotation = self.rot_conv[transition_idx](x).features.reshape(-1, n_primitives, 4)
         scale = self.gmm_scale_min + (self.gmm_scale_max - self.gmm_scale_min) * torch.sigmoid(scale_logits)
-        scale = scale * self._gmm_level_spacing(transition_idx)
+        scale = scale * spacing
+        offset = torch.tanh(offset_logits) * spacing * self.gmm_offset_range
+        centers = base_coords[:, None, :] + offset
         return dict(
-            coords=x.coordinates[:, 1:].float() * self.voxel_size,
+            anchor_coords=base_coords,
+            coords=centers,
+            offset=offset,
             permutations=x.decomposition_permutations,
             opacity=opacity.reshape(-1, n_primitives),
             scale=scale,
             rotation=self._quaternion_to_matrix(rotation),
-            spacing=x.features.new_tensor(self._gmm_level_spacing(transition_idx)))
+            spacing=x.features.new_tensor(spacing),
+            transition_idx=transition_idx)
 
 
     def _gmm_regularizers(self, gmm_params):
         opacity = gmm_params['opacity']
         scale = gmm_params['scale']
+        offset = gmm_params['offset']
         spacing = gmm_params['spacing']
         volume = torch.prod(scale / spacing.clamp_min(1e-6), dim=-1).mean()
         opacity_entropy = -(opacity * torch.log(opacity + 1e-6) +
                             (1 - opacity) * torch.log(1 - opacity + 1e-6)).mean()
-        return volume, opacity_entropy
+        offset_penalty = (offset.abs() / spacing.clamp_min(1e-6)).mean()
+        return volume, opacity_entropy, offset_penalty
+
+
+    def _aggregate_gmm_scores(self, scores, valid_mask=None):
+        if scores.shape[-1] == 0:
+            return scores.new_zeros(scores.shape[:-1])
+
+        if self.gmm_aggregation == 'max':
+            return scores.max(dim=-1).values
+
+        k = min(4, scores.shape[-1])
+        top_scores, top_ids = torch.topk(scores, k, dim=-1)
+
+        if self.gmm_aggregation == 'noisy_or':
+            top_scores = top_scores.clamp(0, 1 - 1e-5)
+            return 1.0 - torch.prod(1.0 - top_scores, dim=-1)
+
+        if self.gmm_aggregation == 'topk_mean':
+            if valid_mask is None:
+                return top_scores.mean(dim=-1)
+            top_valid = torch.gather(valid_mask.to(top_scores.dtype), 1, top_ids)
+            denom = top_valid.sum(dim=-1).clamp(min=1)
+            return (top_scores * top_valid).sum(dim=-1) / denom
+
+        raise ValueError(f'Unsupported aggregation: {self.gmm_aggregation}')
 
 
     def _score_gmm_neighbors(self, target_coords, nn_coords, nn_opacity,
                              nn_scale, nn_rotation, valid_mask=None):
-        delta = target_coords[:, None, None, :] - nn_coords[:, :, None, :]
-        delta = delta.expand(-1, -1, self.gmm_num_primitives, -1)
+        delta = target_coords[:, None, None, :] - nn_coords
         delta_local = torch.matmul(
             nn_rotation.transpose(-1, -2), delta.unsqueeze(-1)).squeeze(-1)
         dist = torch.sum((delta_local / nn_scale.clamp_min(1e-6)) ** 2, dim=-1)
         scores = nn_opacity * torch.exp(-0.5 * dist)
         if valid_mask is not None:
             scores = scores * valid_mask.unsqueeze(-1)
-        return scores.reshape(len(target_coords), -1).max(dim=1).values
+            valid_mask = valid_mask.unsqueeze(-1).expand_as(scores).reshape(
+                len(target_coords), -1)
+        scores = scores.reshape(len(target_coords), -1)
+        return self._aggregate_gmm_scores(scores, valid_mask=valid_mask)
 
 
     def _evaluate_gmm_field_cdist(self, target_x, gmm_params):
@@ -339,22 +394,24 @@ class DSPHead(BaseModule):
         opacity = gmm_params['opacity']
         scale = gmm_params['scale']
         rotation = gmm_params['rotation']
+        anchor_coords = gmm_params['anchor_coords']
         source_coords = gmm_params['coords']
         chunk_size = max(int(self.gmm_chunk_size), 1)
 
         for source_perm, target_perm in zip(gmm_params['permutations'], target_x.decomposition_permutations):
             if len(source_perm) == 0 or len(target_perm) == 0:
                 continue
+            scene_anchor_coords = anchor_coords[source_perm]
             scene_source_coords = source_coords[source_perm]
             scene_opacity = opacity[source_perm]
             scene_scale = scale[source_perm]
             scene_rotation = rotation[source_perm]
             scene_target_coords = target_x.coordinates[target_perm][:, 1:].float() * self.voxel_size
-            k = min(int(self.gmm_knn_k), len(scene_source_coords))
+            k = min(int(self.gmm_knn_k), len(scene_anchor_coords))
             for start in range(0, len(scene_target_coords), chunk_size):
                 end = min(start + chunk_size, len(scene_target_coords))
                 target_chunk = scene_target_coords[start:end]
-                nn_ids = torch.cdist(target_chunk, scene_source_coords).topk(
+                nn_ids = torch.cdist(target_chunk, scene_anchor_coords).topk(
                     k, largest=False, sorted=False).indices
                 keep_prob[target_perm[start:end]] = self._score_gmm_neighbors(
                     target_chunk,
@@ -445,7 +502,8 @@ class DSPHead(BaseModule):
         return candidate_ids.reshape(len(target_cells), -1)
 
 
-    def _score_gmm_local_candidates(self, target_chunk, target_cells, scene_source_coords,
+    def _score_gmm_local_candidates(self, target_chunk, target_cells, scene_anchor_coords,
+                                    scene_source_coords,
                                     scene_opacity, scene_scale, scene_rotation,
                                     offsets, min_cell, grid_shape, lookup):
         local_ids = self._gather_gmm_local_candidates(
@@ -455,7 +513,7 @@ class DSPHead(BaseModule):
             return target_chunk.new_zeros((len(target_chunk),)), valid_mask.any(dim=1)
 
         safe_ids = local_ids.clamp_min(0)
-        candidate_coords = scene_source_coords[safe_ids]
+        candidate_coords = scene_anchor_coords[safe_ids]
         candidate_distances = torch.sum((candidate_coords - target_chunk[:, None, :]) ** 2, dim=-1)
         candidate_distances = candidate_distances.masked_fill(~valid_mask, float('inf'))
 
@@ -481,6 +539,7 @@ class DSPHead(BaseModule):
         opacity = gmm_params['opacity']
         scale = gmm_params['scale']
         rotation = gmm_params['rotation']
+        anchor_coords = gmm_params['anchor_coords']
         source_coords = gmm_params['coords']
         spacing = gmm_params['spacing']
         chunk_size = max(int(self.gmm_chunk_size), 1)
@@ -500,12 +559,13 @@ class DSPHead(BaseModule):
             if len(source_perm) == 0 or len(target_perm) == 0:
                 continue
 
+            scene_anchor_coords = anchor_coords[source_perm]
             scene_source_coords = source_coords[source_perm]
             scene_opacity = opacity[source_perm]
             scene_scale = scale[source_perm]
             scene_rotation = rotation[source_perm]
             scene_target_coords = target_x.coordinates[target_perm][:, 1:].float() * self.voxel_size
-            source_cells = torch.floor(scene_source_coords / cell_size).long()
+            source_cells = torch.floor(scene_anchor_coords / cell_size).long()
             target_cells = torch.floor(scene_target_coords / cell_size).long()
             lookup_radius = fallback_radius if fallback_offsets is not None else primary_radius
             min_cell = torch.min(source_cells.min(dim=0).values,
@@ -520,13 +580,15 @@ class DSPHead(BaseModule):
                 target_chunk = scene_target_coords[start:end]
                 chunk_target_cells = target_cells[start:end]
                 chunk_scores, found_mask = self._score_gmm_local_candidates(
-                    target_chunk, chunk_target_cells, scene_source_coords,
+                    target_chunk, chunk_target_cells, scene_anchor_coords,
+                    scene_source_coords,
                     scene_opacity, scene_scale, scene_rotation, primary_offsets,
                     min_cell, grid_shape, lookup)
 
                 if fallback_mode == 'expand' and fallback_offsets is not None:
                     chunk_scores, found_mask = self._score_gmm_local_candidates(
-                        target_chunk, chunk_target_cells, scene_source_coords,
+                        target_chunk, chunk_target_cells, scene_anchor_coords,
+                        scene_source_coords,
                         scene_opacity, scene_scale, scene_rotation, fallback_offsets,
                         min_cell, grid_shape, lookup)
                 elif fallback_mode == 'nearest_missing':
@@ -534,6 +596,7 @@ class DSPHead(BaseModule):
                     if missing_mask.any() and fallback_offsets is not None:
                         fallback_scores, fallback_found = self._score_gmm_local_candidates(
                             target_chunk[missing_mask], chunk_target_cells[missing_mask],
+                            scene_anchor_coords,
                             scene_source_coords, scene_opacity, scene_scale,
                             scene_rotation, fallback_offsets, min_cell, grid_shape,
                             lookup)
@@ -543,9 +606,9 @@ class DSPHead(BaseModule):
                         found_mask[missing_mask] = fallback_found
                         missing_mask = ~found_mask
                     if missing_mask.any():
-                        k = min(max(int(self.gmm_knn_k), 1), len(scene_source_coords))
+                        k = min(max(int(self.gmm_knn_k), 1), len(scene_anchor_coords))
                         nn_ids = torch.cdist(
-                            target_chunk[missing_mask], scene_source_coords).topk(
+                            target_chunk[missing_mask], scene_anchor_coords).topk(
                                 k, largest=False, sorted=False).indices
                         fallback_scores = self._score_gmm_neighbors(
                             target_chunk[missing_mask],
@@ -569,16 +632,29 @@ class DSPHead(BaseModule):
         else:
             raise ValueError(f'Unsupported GMM neighbor backend: {self.gmm_neighbor_backend}')
 
-        volume, opacity_entropy = self._gmm_regularizers(gmm_params)
-        return keep_prob.clamp(0, 1), volume, opacity_entropy
+        volume, opacity_entropy, offset_penalty = self._gmm_regularizers(gmm_params)
+        return keep_prob.clamp(0, 1), volume, opacity_entropy, offset_penalty
 
 
-    def _apply_gmm_training_gate(self, x, keep_prob):
-        if self.current_epoch < self.gmm_warmup_epochs:
+    def _apply_gmm_soft_gate(self, x, keep_prob, use_warmup=False):
+        if use_warmup and self.current_epoch < self.gmm_warmup_epochs:
             gate = torch.ones_like(keep_prob)
         else:
             gate = self.gmm_train_gate_floor + (1 - self.gmm_train_gate_floor) * keep_prob
         return self._sparse_like(x, x.features * gate.unsqueeze(1))
+
+
+    def _get_gmm_target_keep_ratio(self, transition_idx=None, order_idx=None):
+        if not self.gmm_target_keep_ratios:
+            return None
+
+        if order_idx is None:
+            if transition_idx is None:
+                return None
+            order_idx = len(self.keep_conv) - 1 - int(transition_idx)
+
+        order_idx = max(0, min(int(order_idx), len(self.gmm_target_keep_ratios) - 1))
+        return float(self.gmm_target_keep_ratios[order_idx])
 
 
     def _use_hard_training_prune(self):
@@ -593,60 +669,86 @@ class DSPHead(BaseModule):
         return self._use_hard_training_prune()
 
 
-    def _apply_gmm_training_pruning(self, x, keep_prob):
+    def _apply_gmm_training_pruning(self, x, keep_prob, transition_idx=None):
         if not self._use_hard_training_prune():
-            return self._apply_gmm_training_gate(x, keep_prob)
+            return self._apply_gmm_soft_gate(x, keep_prob, use_warmup=True)
 
         if self.current_epoch < self.gmm_warmup_epochs:
             return x
 
         with torch.no_grad():
-            prune_mask = self._make_gmm_prune_mask(x, keep_prob)
+            prune_mask = self._make_gmm_prune_mask(
+                x, keep_prob, transition_idx=transition_idx)
         if prune_mask.sum() == 0:
             return None
         return self.pruning(x, prune_mask)
 
 
-    def _make_gmm_prune_mask(self, x, keep_prob):
+    def _make_gmm_prune_mask(self, x, keep_prob, transition_idx=None):
         prune_mask = keep_prob.new_zeros((len(keep_prob),), dtype=torch.bool)
+        target_ratio = self._get_gmm_target_keep_ratio(transition_idx=transition_idx)
         for permutation in x.decomposition_permutations:
             if len(permutation) == 0:
                 continue
             score = keep_prob[permutation]
-            mask = score > self.gmm_keep_threshold
+            mask = torch.zeros_like(score, dtype=torch.bool)
             min_keep = min(int(self.gmm_min_keep), len(score))
             max_keep = min(int(self.gmm_max_keep), len(score))
-            if mask.sum() < min_keep:
-                ids = torch.topk(score, min_keep, sorted=False).indices
+
+            if target_ratio is not None:
+                num_keep = max(min_keep, int(round(len(score) * target_ratio)))
+                if max_keep > 0:
+                    num_keep = min(num_keep, max_keep)
+                num_keep = min(max(num_keep, 1), len(score))
+                ids = torch.topk(score, num_keep, sorted=False).indices
                 mask = torch.zeros_like(mask)
                 mask[ids] = True
-            if max_keep > 0 and mask.sum() > max_keep:
-                kept_scores = score.masked_fill(~mask, -1)
-                ids = torch.topk(kept_scores, max_keep, sorted=False).indices
-                mask = torch.zeros_like(mask)
-                mask[ids] = True
-            if mask.sum() == 0:
-                mask[torch.argmax(score)] = True
+            else:
+                mask = score > self.gmm_keep_threshold
+                if mask.sum() < min_keep:
+                    ids = torch.topk(score, min_keep, sorted=False).indices
+                    mask = torch.zeros_like(mask)
+                    mask[ids] = True
+                if max_keep > 0 and mask.sum() > max_keep:
+                    kept_scores = score.masked_fill(~mask, -1)
+                    ids = torch.topk(kept_scores, max_keep, sorted=False).indices
+                    mask = torch.zeros_like(mask)
+                    mask[ids] = True
+                if mask.sum() == 0:
+                    mask[torch.argmax(score)] = True
             prune_mask[permutation[mask]] = True
         return prune_mask
 
 
-    def _prune_gmm_inference(self, x, keep_prob):
+    def _prune_gmm_inference(self, x, keep_prob, transition_idx=None):
         with torch.no_grad():
-            prune_mask = self._make_gmm_prune_mask(x, keep_prob)
+            prune_mask = self._make_gmm_prune_mask(
+                x, keep_prob, transition_idx=transition_idx)
         if prune_mask.sum() == 0:
             return None
         return self.pruning(x, prune_mask)
 
 
-    def _apply_gmm_test_pruning(self, x, keep_prob):
+    def _apply_gmm_test_pruning(self, x, keep_prob, transition_idx=None):
         if self._use_hard_test_prune():
-            return self._prune_gmm_inference(x, keep_prob)
-        return self._apply_gmm_training_gate(x, keep_prob)
+            return self._prune_gmm_inference(
+                x, keep_prob, transition_idx=transition_idx)
+        return self._apply_gmm_soft_gate(x, keep_prob, use_warmup=False)
 
 
     def _split_by_permutation(self, values, x):
         return [values[permutation] for permutation in x.decomposition_permutations]
+
+
+    def _align_sparse_values(self, source_x, values, target_x):
+        if len(values) == len(target_x.features) and \
+                source_x.coordinate_map_key == target_x.coordinate_map_key:
+            return values
+
+        sparse_values = self._sparse_like(source_x, values.unsqueeze(1))
+        aligned_values = sparse_values.features_at_coordinates(
+            target_x.coordinates.float()).squeeze(1)
+        return aligned_values.clamp(0, 1)
 
 
     def _fuse_gmm_scores(self, scores, keep_probs):
@@ -706,7 +808,8 @@ class DSPHead(BaseModule):
         keep_gts = []
         keep_hard_gts = []
         keep_preds, prune_masks = [], []
-        gmm_volume_losses, gmm_sparsity_losses = [], []
+        keep_transition_ids = []
+        gmm_volume_losses, gmm_sparsity_losses, gmm_offset_losses = [], [], []
         prune_mask = None
         inputs = x
         x = inputs[-1]
@@ -721,7 +824,8 @@ class DSPHead(BaseModule):
                                               coordinate_map_key=x.coordinate_map_key,
                                               coordinate_manager=x.coordinate_manager)
                     x = x + x_level
-                    keep_prob, volume_loss, sparsity_loss = self._evaluate_gmm_field(x, gmm_params)
+                    keep_prob, volume_loss, sparsity_loss, offset_loss = self._evaluate_gmm_field(
+                        x, gmm_params)
                     if self.gmm_target_type == 'soft_occ':
                         prune_mask, soft_target = self._get_keep_voxel(
                             x, i + 2, bboxes_state, img_metas, return_soft=True)
@@ -743,15 +847,18 @@ class DSPHead(BaseModule):
                     keep_gts.append(keep_gt)
                     keep_hard_gts.append(keep_hard_gt)
                     keep_preds.append(keeps)
+                    keep_transition_ids.append(gmm_params['transition_idx'])
                     gmm_volume_losses.append(volume_loss)
                     gmm_sparsity_losses.append(sparsity_loss)
-                    x = self._apply_gmm_training_pruning(x, keep_prob)
+                    gmm_offset_losses.append(offset_loss)
+                    x = self._apply_gmm_training_pruning(
+                        x, keep_prob, transition_idx=gmm_params['transition_idx'])
                     if x is None:
                         break
                 else:
                     prune_mask = self._get_keep_voxel(x, i + 2, bboxes_state, img_metas)
                     keep_gt = []
-                    for permutation in out.decomposition_permutations:
+                    for permutation in x.decomposition_permutations:
                         keep_gt.append(prune_mask[permutation])
                     keep_gts.append(keep_gt)
                     keep_hard_gts.append(keep_gt)
@@ -779,6 +886,7 @@ class DSPHead(BaseModule):
                     for permutation in x.decomposition_permutations:
                         keeps.append(keep_pred[permutation])
                     keep_preds.append(keeps)
+                    keep_transition_ids.append(i - 1)
             x = self.__getattr__(f'lateral_block_{i}')(x)
             out = self.__getattr__(f'out_block_{i}')(x)
             bbox_pred, cls_pred, point, prune_training = self._forward_single(out)
@@ -787,8 +895,8 @@ class DSPHead(BaseModule):
             points.append(point)
 
         return (bbox_preds[::-1], cls_preds[::-1], points[::-1], keep_preds[::-1],
-                keep_gts[::-1], keep_hard_gts[::-1], bboxes_level,
-                gmm_volume_losses, gmm_sparsity_losses)
+                keep_gts[::-1], keep_hard_gts[::-1], keep_transition_ids[::-1], bboxes_level,
+                gmm_volume_losses, gmm_sparsity_losses, gmm_offset_losses)
 
 
     def _prune_inference(self, x, scores):
@@ -899,7 +1007,7 @@ class DSPHead(BaseModule):
                         inside_box_condition = margin > 0
                         inside_box_condition = inside_box_condition.sum(dim=1)
                         inside_box_condition = inside_box_condition >= 1
-                        inside_box_conditions += inside_box_condition
+                        inside_box_conditions |= inside_box_condition
                         if return_soft:
                             if self.gmm_soft_target_norm_mode == 'box_adaptive':
                                 box_min_edge = boxes_l[..., 4:7].amin(dim=-1)
@@ -1033,8 +1141,9 @@ class DSPHead(BaseModule):
 
 
     def _loss(self, bbox_preds, cls_preds, points,
-              gt_bboxes, gt_labels, img_metas, keep_preds, keep_gts, keep_hard_gts, bboxes_level,
-              gmm_volume_losses=None, gmm_sparsity_losses=None):
+              gt_bboxes, gt_labels, img_metas, keep_preds, keep_gts, keep_hard_gts,
+              keep_transition_ids, bboxes_level,
+              gmm_volume_losses=None, gmm_sparsity_losses=None, gmm_offset_losses=None):
         bbox_losses, cls_losses, pos_masks = [], [], []
         zero_loss = self.bbox_conv.kernel.sum() * 0
 
@@ -1065,8 +1174,14 @@ class DSPHead(BaseModule):
                         avg_factor = loss_weight.sum().clamp(min=1)
                         k_loss = keep_loss.sum() / avg_factor / len(keep_preds) + k_loss
                         if self.gmm_budget_loss_weight > 0:
+                            target_ratio = self._get_gmm_target_keep_ratio(
+                                transition_idx=keep_transition_ids[j])
+                            if target_ratio is None:
+                                target_ratio = gt.mean()
+                            else:
+                                target_ratio = pred.new_tensor(target_ratio)
                             budget_loss = F.smooth_l1_loss(
-                                pred.mean(), gt.mean(), reduction='mean') / len(keep_preds) + budget_loss
+                                pred.mean(), target_ratio, reduction='mean') / len(keep_preds) + budget_loss
                     else:
                         gt = gt.long()
                         avg_factor = gt.sum() if gt.sum() != 0 else gt.new_tensor(gt.numel())
@@ -1107,16 +1222,23 @@ class DSPHead(BaseModule):
                 loss_dict['loss_gmm_sparsity'] = self.gmm_sparsity_loss_weight * torch.stack(gmm_sparsity_losses).mean()
             else:
                 loss_dict['loss_gmm_sparsity'] = zero_loss
+            if self.gmm_offset_loss_weight > 0 and gmm_offset_losses:
+                loss_dict['loss_gmm_offset'] = self.gmm_offset_loss_weight * torch.stack(gmm_offset_losses).mean()
+            elif self.gmm_offset_loss_weight > 0:
+                loss_dict['loss_gmm_offset'] = zero_loss
         return loss_dict
 
 
     def forward_train(self, x, gt_bboxes, gt_labels, img_metas):
-        (bbox_preds, cls_preds, points, keep_preds, keep_gts, keep_hard_gts, bboxes_level,
-         gmm_volume_losses, gmm_sparsity_losses) = self(x, gt_bboxes, gt_labels, img_metas)
+        (bbox_preds, cls_preds, points, keep_preds, keep_gts, keep_hard_gts,
+         keep_transition_ids, bboxes_level,
+         gmm_volume_losses, gmm_sparsity_losses, gmm_offset_losses) = self(
+            x, gt_bboxes, gt_labels, img_metas)
         return self._loss(bbox_preds, cls_preds, points,
-                          gt_bboxes, gt_labels, img_metas, keep_preds, keep_gts, keep_hard_gts,
+                          gt_bboxes, gt_labels, img_metas,
+                          keep_preds, keep_gts, keep_hard_gts, keep_transition_ids,
                           bboxes_level,
-                          gmm_volume_losses, gmm_sparsity_losses)
+                          gmm_volume_losses, gmm_sparsity_losses, gmm_offset_losses)
 
 
     def _nms(self, bboxes, scores, img_meta):
@@ -1223,6 +1345,7 @@ class DSPHead(BaseModule):
         gmm_params = None
         for i in range(len(inputs) - 1, -1, -1):
             current_keep_prob = None
+            current_keep_prob_source = None
             if i < len(inputs) - 1:
                 if self.gaussian_pruning_enabled:
                     x = self.__getattr__(f'up_block_{i + 1}')(x)
@@ -1232,9 +1355,11 @@ class DSPHead(BaseModule):
                                               coordinate_map_key=x.coordinate_map_key,
                                               coordinate_manager=x.coordinate_manager)
                     x = x + x_level
-                    keep_prob, _, _ = self._evaluate_gmm_field(x, gmm_params)
+                    keep_prob, _, _, _ = self._evaluate_gmm_field(x, gmm_params)
                     current_keep_prob = keep_prob
-                    x = self._apply_gmm_test_pruning(x, keep_prob)
+                    current_keep_prob_source = x
+                    x = self._apply_gmm_test_pruning(
+                        x, keep_prob, transition_idx=gmm_params['transition_idx'])
                     if x is None:
                         break
                 else:
@@ -1267,6 +1392,9 @@ class DSPHead(BaseModule):
             if keep_probs is not None:
                 if current_keep_prob is None:
                     current_keep_prob = out.features.new_ones((len(out.features),))
+                else:
+                    current_keep_prob = self._align_sparse_values(
+                        current_keep_prob_source, current_keep_prob, out)
                 keep_probs.append(self._split_by_permutation(current_keep_prob, out))
 
         keep_probs = keep_probs[::-1] if keep_probs is not None else None
